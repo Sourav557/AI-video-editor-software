@@ -41,6 +41,14 @@ export const api = {
     req<{ clips: any[]; message: string }>(`/api/projects/${pid}/clips`),
   renderClip: (pid: string, idx: number) =>
     req<{ render_job: string }>(`/api/projects/${pid}/clips/${idx}/render`, { method: 'POST' }),
+  platforms: () =>
+    req<{ version: number; platforms: Record<string, { label: string }> }>(`/api/platforms`),
+  exportClip: (pid: string, idx: number, platform: string) =>
+    req<{ export_job: string }>(`/api/projects/${pid}/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clip_index: idx, platform }),
+    }),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

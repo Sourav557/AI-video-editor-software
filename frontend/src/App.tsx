@@ -28,6 +28,9 @@ export default function App() {
   const [finding, setFinding] = useState(false)
   const [rendering, setRendering] = useState<Record<number, string>>({})
   const [rendered, setRendered] = useState<Record<number, boolean>>({})
+  const [platforms, setPlatforms] = useState<[string, string][]>([])
+  const [exporting, setExporting] = useState<Record<string, boolean>>({})
+  const [exported, setExported] = useState<Record<string, string>>({})
   const [error, setError] = useState('')
   const pollRef = useRef<number | null>(null)
 
@@ -59,6 +62,12 @@ export default function App() {
   )
 
   useEffect(() => () => stopPolling(), [])
+
+  useEffect(() => {
+    api.platforms()
+      .then((p) => setPlatforms(Object.entries(p.platforms).map(([k, v]) => [k, v.label])))
+      .catch(() => {})
+  }, [])
 
   const doUpload = async (file: File) => {
     setError(''); setPhase('uploading')
@@ -116,6 +125,23 @@ export default function App() {
     }
   }
 
+  const doExport = async (idx: number, platform: string) => {
+    if (!projectId) return
+    const key = `${idx}-${platform}`
+    setError('')
+    setExporting((e) => ({ ...e, [key]: true }))
+    try {
+      const { export_job } = await api.exportClip(projectId, idx, platform)
+      pollUntilDone([export_job], async () => {
+        setExported((e) => ({ ...e, [key]: `export_${platform}_clip${idx}.mp4` }))
+        setExporting((e) => { const n = { ...e }; delete n[key]; return n })
+      })
+    } catch (e: any) {
+      setError(e.message)
+      setExporting((e) => { const n = { ...e }; delete n[key]; return n })
+    }
+  }
+
   const analyzing = phase === 'analyzing'
   const analyzed = phase === 'analyzed'
   const jobList = Object.values(jobs)
@@ -134,7 +160,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 2: Clips + Captions</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 3: Multi-platform export</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -237,6 +263,29 @@ export default function App() {
                           {c.index in rendering ? 'Rendering…' : '🎞 Render 9:16 captioned clip'}
                         </button>
                       )}
+                    </div>
+                    {/* Multi-platform export */}
+                    <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+                      <div className="faint text-xs mb-2">Export for platform <span className="ai-glow">· aspect + captions + loudness</span></div>
+                      <div className="flex flex-wrap gap-2">
+                        {platforms.map(([key, label]) => {
+                          const ek = `${c.index}-${key}`
+                          return exported[ek] && projectId ? (
+                            <a key={key} className="text-xs px-3 py-1.5 rounded-full card"
+                               style={{ color: 'var(--cyan)' }}
+                               href={`/api/projects/${projectId}/exports/${exported[ek]}`} download>
+                              ⬇ {label}
+                            </a>
+                          ) : (
+                            <button key={key}
+                              className="text-xs px-3 py-1.5 rounded-full card muted hover:text-white"
+                              disabled={ek in exporting}
+                              onClick={() => doExport(c.index, key)}>
+                              {ek in exporting ? '…' : label}
+                            </button>
+                          )
+                        })}
+                      </div>
                     </div>
                   </div>
                 ))}

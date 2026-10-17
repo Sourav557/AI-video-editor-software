@@ -5,6 +5,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from ..orchestrator.queue import orchestrator
+from ..platforms import PRESET_VERSION, PRESETS
 from ..projects import (get_video_path, load_json, new_project, project_dir,
                         project_exists, save_upload)
 
@@ -113,3 +114,40 @@ def clip_file(pid: str, idx: int):
     if not path.exists():
         raise HTTPException(404, "clip not rendered yet")
     return FileResponse(path, media_type="video/mp4", filename=f"clip_{idx}.mp4")
+
+
+# ---- Slice 3: multi-platform export ----
+
+@router.get("/platforms")
+def list_platforms():
+    return {"version": PRESET_VERSION, "platforms": PRESETS}
+
+
+@router.post("/projects/{pid}/export")
+def export_clip(pid: str, body: dict):
+    """Queue a platform export. Body: {"clip_index": int, "platform": str}."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    platform = body.get("platform", "tiktok")
+    if platform not in PRESETS:
+        raise HTTPException(400, f"unknown platform; choose from {sorted(PRESETS)}")
+    idx = body.get("clip_index")
+    clips = load_json(pid, "clips.json")
+    if idx is None or not clips or idx >= len(clips["clips"]):
+        raise HTTPException(400, "clip not found — run Find clips first")
+    job = orchestrator.submit("export", pid, priority=10,
+                              params={"clip_index": idx, "platform": platform})
+    return {"export_job": job.id, "platform": platform, "clip_index": idx}
+
+
+@router.get("/projects/{pid}/exports/{filename}")
+def export_file(pid: str, filename: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not filename.startswith("export_") or not filename.endswith(".mp4") \
+            or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "invalid filename")
+    path = project_dir(pid) / filename
+    if not path.exists():
+        raise HTTPException(404, "export not ready yet")
+    return FileResponse(path, media_type="video/mp4", filename=filename)
