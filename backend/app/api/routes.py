@@ -250,3 +250,38 @@ def seo_get(pid: str):
     if seo is None:
         raise HTTPException(404, "no packaging yet — run Publish prep first")
     return seo
+
+
+# ---- Slice 6: the co-editor agent ----
+
+@router.post("/projects/{pid}/chat")
+def chat(pid: str, body: dict):
+    """Send a message to the co-editor agent. Returns a job id to poll."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    message = (body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(400, "message is required")
+    job = orchestrator.submit("agent", pid, priority=20,
+                              params={"message": message})
+    return {"chat_job": job.id}
+
+
+@router.get("/projects/{pid}/chat")
+def chat_history(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    return load_json(pid, "chat.json") or {"messages": []}
+
+
+@router.get("/projects/{pid}/montage/{filename}")
+def montage_file(pid: str, filename: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not filename.startswith("montage_") or not filename.endswith(".mp4") \
+            or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "invalid filename")
+    path = project_dir(pid) / filename
+    if not path.exists():
+        raise HTTPException(404, "montage not ready yet")
+    return FileResponse(path, media_type="video/mp4", filename=filename)

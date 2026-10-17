@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmtTime, JobStatus, Segment, Silence } from './api'
 import VoiceStudio from './VoiceStudio'
 import PublishPrep from './PublishPrep'
+import ChatPanel from './ChatPanel'
 
 type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'analyzed' | 'error'
 
@@ -176,7 +177,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 5: Publish prep</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 6: Co-editor agent</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -355,11 +356,21 @@ export default function App() {
                 </>
               )}
             </section>
+
+            {/* Co-editor chat */}
+            <section className="card p-6">
+              <h2 className="font-semibold text-lg mb-1">6 · Co-editor</h2>
+              <p className="muted text-sm mb-4">
+                Talk to your <span className="ai-glow font-medium">editing agent</span> — it plans,
+                calls the workers, and reports back. One conversation, every tool.
+              </p>
+              {projectId && <ChatPanel projectId={projectId} />}
+            </section>
           </>
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 5 of the roadmap — next: the editing agent, then the .exe desktop build. Nothing leaves your machine.
+          Slice 6 of the roadmap — the browser build is feature-complete. Next: the .exe desktop build. Nothing leaves your machine.
         </footer>
       </main>
     </div>

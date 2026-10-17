@@ -69,6 +69,13 @@ export const api = {
   seoGenerate: (pid: string) =>
     req<{ seo_job: string }>(`/api/projects/${pid}/seo`, { method: 'POST' }),
   seoGet: (pid: string) => req<any>(`/api/projects/${pid}/seo`),
+  chat: (pid: string, message: string) =>
+    req<{ chat_job: string }>(`/api/projects/${pid}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    }),
+  chatHistory: (pid: string) => req<{ messages: any[] }>(`/api/projects/${pid}/chat`),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }
