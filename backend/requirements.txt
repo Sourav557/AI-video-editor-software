@@ -10,6 +10,8 @@ faster-whisper>=1.0.0
 # kwarg that faster-whisper's audio decoder requires.
 av>=12,<19
 pydantic>=2.0
+# Slice 5: keyless YouTube autocomplete enrichment (offline-tolerant)
+requests
 # Slice 4: Qwen3-TTS (Apache-2.0) voiceover + voice cloning
 # hf_transfer: fast parallel HF downloads (also helps on slow links)
 hf_transfer

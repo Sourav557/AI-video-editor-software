@@ -66,6 +66,9 @@ export const api = {
     fd.append('ref_audio', refFile)
     return req<{ tts_job: string }>(`/api/projects/${pid}/tts/clone`, { method: 'POST', body: fd })
   },
+  seoGenerate: (pid: string) =>
+    req<{ seo_job: string }>(`/api/projects/${pid}/seo`, { method: 'POST' }),
+  seoGet: (pid: string) => req<any>(`/api/projects/${pid}/seo`),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

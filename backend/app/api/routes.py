@@ -227,3 +227,26 @@ def tts_file(pid: str, filename: str):
     if not path.exists():
         raise HTTPException(404, "voiceover not ready yet")
     return FileResponse(path, media_type="audio/wav", filename=filename)
+
+
+# ---- Slice 5: SEO / packaging / discovery engine ----
+
+@router.post("/projects/{pid}/seo")
+def seo_generate(pid: str):
+    """Queue the packaging worker. Requires a transcript (run Analyze first)."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if load_json(pid, "transcript.json") is None:
+        raise HTTPException(400, "no transcript yet — run Analyze first")
+    job = orchestrator.submit("seo", pid, priority=10)
+    return {"seo_job": job.id}
+
+
+@router.get("/projects/{pid}/seo")
+def seo_get(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    seo = load_json(pid, "seo.json")
+    if seo is None:
+        raise HTTPException(404, "no packaging yet — run Publish prep first")
+    return seo

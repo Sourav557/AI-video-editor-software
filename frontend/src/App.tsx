@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmtTime, JobStatus, Segment, Silence } from './api'
 import VoiceStudio from './VoiceStudio'
+import PublishPrep from './PublishPrep'
 
 type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'analyzed' | 'error'
 
@@ -32,6 +33,8 @@ export default function App() {
   const [platforms, setPlatforms] = useState<[string, string][]>([])
   const [exporting, setExporting] = useState<Record<string, boolean>>({})
   const [exported, setExported] = useState<Record<string, string>>({})
+  const [seoData, setSeoData] = useState<any>(null)
+  const [generatingSeo, setGeneratingSeo] = useState(false)
   const [error, setError] = useState('')
   const pollRef = useRef<number | null>(null)
 
@@ -126,6 +129,18 @@ export default function App() {
     }
   }
 
+  const doSeo = async () => {
+    if (!projectId) return
+    setError(''); setGeneratingSeo(true); setSeoData(null)
+    try {
+      const { seo_job } = await api.seoGenerate(projectId)
+      pollUntilDone([seo_job], async () => {
+        setSeoData(await api.seoGet(projectId))
+        setGeneratingSeo(false)
+      })
+    } catch (e: any) { setError(e.message); setGeneratingSeo(false) }
+  }
+
   const doExport = async (idx: number, platform: string) => {
     if (!projectId) return
     const key = `${idx}-${platform}`
@@ -161,7 +176,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 4: Voice studio</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 5: Publish prep</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -306,11 +321,45 @@ export default function App() {
                 {segments.length === 0 && <div className="muted text-sm">No speech detected.</div>}
               </div>
             </section>
+
+            {/* Voice studio */}
+            <section className="card p-6">
+              <h2 className="font-semibold text-lg mb-1">4 · Voice studio</h2>
+              <p className="muted text-sm mb-4">
+                <span className="ai-glow font-medium">Qwen3-TTS</span> voiceovers — preset voices with emotion direction,
+                or clone your own voice from a 3s+ clip (consent-gated).
+              </p>
+              {projectId && <VoiceStudio projectId={projectId} />}
+            </section>
+
+            {/* Publish prep */}
+            <section className="card p-6">
+              <h2 className="font-semibold text-lg mb-1">5 · Publish prep</h2>
+              <p className="muted text-sm mb-4">
+                The <span className="ai-glow font-medium">packaging engine</span> turns your transcript into ranked keywords,
+                titles, descriptions, hashtags and thumbnail text — per platform, per clip.
+              </p>
+              {!seoData ? (
+                <>
+                  <button className="btn-primary px-6 py-3 text-white" disabled={generatingSeo} onClick={doSeo}>
+                    {generatingSeo ? 'Packaging…' : '📦 Generate packaging'}
+                  </button>
+                  {generatingSeo && <ProgressBar overall={overall} jobList={jobList} />}
+                </>
+              ) : (
+                <>
+                  <button className="text-sm muted underline mb-4" onClick={doSeo} disabled={generatingSeo}>
+                    Regenerate
+                  </button>
+                  <PublishPrep data={seoData} />
+                </>
+              )}
+            </section>
           </>
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 4 of the roadmap — next: SEO/packaging engine, then the editing agent. Nothing leaves your machine.
+          Slice 5 of the roadmap — next: the editing agent, then the .exe desktop build. Nothing leaves your machine.
         </footer>
       </main>
     </div>
