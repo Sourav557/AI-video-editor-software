@@ -155,6 +155,15 @@ def _source_wh(video) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def _source_has_audio(video) -> bool:
+    """True if the source video has at least one audio stream (ffprobe, once per job)."""
+    ffprobe = shutil.which("ffprobe")
+    pr = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a:0",
+                         "-show_entries", "stream=index", "-of", "csv=p=0",
+                         str(video)], capture_output=True, text=True)
+    return bool(pr.stdout.strip())
+
+
 def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
     """-vf string for a keyframed block.
 
@@ -179,6 +188,108 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
     ov = (f"[bg][fg]overlay=x=(W-w)/2+({XX}):y=(H-h)/2+({YY})"
           f":eof_action=pass,format=yuv420p")
     return f"{fg};{bg};{ov}"
+
+
+# ---- Slice 12: transitions library ----
+# block.transition = {"type": <xfade name>, "dur": seconds}, set on the LEFT
+# block of a join; applies to the join between that block and the next V1
+# block. Absence = hard cut.
+TRANSITION_TYPES = (
+    "dissolve", "fade", "fadeblack", "fadewhite",
+    "wipeleft", "wiperight", "wipeup", "wipedown",
+    "slideleft", "slideright", "circleopen", "circleclose",
+    "smoothleft", "smoothright",
+)
+
+TRANSITION_DUR_MIN, TRANSITION_DUR_MAX = 0.1, 2.0
+TRANSITION_DUR_DEFAULT = 0.5
+
+
+def _clean_transition(raw, dur_a: float, dur_b: float) -> dict | None:
+    """Sanitize blocks[i]['transition'] for the join i -> i+1, or None (hard cut)."""
+    if not isinstance(raw, dict):
+        return None
+    typ = raw.get("type")
+    if typ not in TRANSITION_TYPES:
+        return None
+    try:
+        dur = float(raw.get("dur", TRANSITION_DUR_DEFAULT))
+    except (TypeError, ValueError):
+        dur = TRANSITION_DUR_DEFAULT
+    dur = min(max(dur, TRANSITION_DUR_MIN), TRANSITION_DUR_MAX)
+    # xfade needs offset + dur <= first-input duration; keep the overlap
+    # strictly inside both segments.
+    dur = min(dur, 0.9 * min(dur_a, dur_b))
+    if dur < 0.05:
+        return None
+    return {"type": typ, "dur": dur}
+
+
+def _acrossfade_curve_opt(ffmpeg: str) -> str:
+    """Option string for a triangular acrossfade curve, per ffmpeg version.
+
+    ffmpeg < 8 uses curve=tri; ffmpeg 8.x renamed it to curve1/curve2
+    (default is already tri, but be explicit).
+    """
+    pr = subprocess.run([ffmpeg, "-hide_banner", "-h", "filter=acrossfade"],
+                        capture_output=True, text=True)
+    if "curve1" in pr.stdout:
+        return "curve1=tri:curve2=tri"
+    return "curve=tri"
+
+
+def _join_segments(ffmpeg: str, pid: str, seg_files: list[str],
+                   durs: list[float], joins: list[dict | None]) -> tuple[str, float]:
+    """Join per-block segments.
+
+    No transitions anywhere -> the old fast path (concat demuxer, -c copy).
+    Otherwise one filter_complex pass: chained xfade (video) + acrossfade
+    (audio) for transition joins, concat filters for hard-cut joins.
+    Returns (path_used, expected_duration).
+    """
+    d = project_dir(pid)
+    out = d / "edit.mp4"
+    if not any(joins):
+        lst = d / "edl_list.txt"
+        lst.write_text("".join(f"file '{p}'\n" for p in seg_files))
+        subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "concat", "-safe", "0", "-i", str(lst),
+                        "-c", "copy", str(out)], check=True)
+        return "copy", sum(durs)
+
+    curve_opt = _acrossfade_curve_opt(ffmpeg)
+    fc: list[str] = []
+    vcur, acur = "[0:v]", "[0:a]"
+    cum = durs[0]  # duration of the chained output after each join
+    for i, j in enumerate(joins):
+        if j:
+            dd = j["dur"]
+            off = cum - dd  # xfade offset on the first input's timeline
+            fc.append(f"{vcur}[{i + 1}:v]xfade=transition={j['type']}"
+                      f":duration={dd:.3f}:offset={off:.3f}[v{i + 1}]")
+            fc.append(f"{acur}[{i + 1}:a]acrossfade=d={dd:.3f}:{curve_opt}[a{i + 1}]")
+            cum += durs[i + 1] - dd
+        else:
+            fc.append(f"{vcur}[{i + 1}:v]concat=n=2:v=1:a=0[v{i + 1}]")
+            fc.append(f"{acur}[{i + 1}:a]concat=n=2:v=0:a=1[a{i + 1}]")
+            cum += durs[i + 1]
+        vcur, acur = f"[v{i + 1}]", f"[a{i + 1}]"
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    for s in seg_files:
+        cmd += ["-i", s]
+    cmd += ["-filter_complex", ";".join(fc), "-map", vcur, "-map", acur,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", str(out)]
+    subprocess.run(cmd, check=True)
+    return "xfade", cum
+    """Titles overlapping this block, shifted into the block's local time."""
+    out = []
+    for tl in titles:
+        s = float(tl.get("start", 0)) - edit_cursor
+        e = float(tl.get("end", 0)) - edit_cursor
+        if e > 0 and s < 1e9:
+            out.append({**tl, "start": max(0.0, s), "end": max(0.0, e)})
+    return out
 
 
 def _titles_for_block(titles: list[dict], edit_cursor: float) -> list[dict]:
@@ -238,10 +349,20 @@ def run(job, report) -> dict:
     t = load_json(pid, "transcript.json") or {}
     words = t.get("words", [])
 
-    seg_files = []
+    # Slice 12: all segments must be xfade-compatible — identical WxH,
+    # fps, pix_fmt and timebase. Normalize everything to the project canvas.
+    proj_wh = _source_wh(video)
+    W, H = proj_wh
+    has_audio = _source_has_audio(video)
+    norm_tail = (f"scale={W}x{H}:force_original_aspect_ratio=decrease,"
+                 f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
+                 f"fps=30,format=yuv420p,settb=AVTB")
+
+    seg_files: list[str] = []
+    seg_durs: list[float] = []
+    kept_blocks: list[dict] = []
     total = len(blocks)
     edit_cursor = 0.0  # position in the final (edit timebase) video
-    src_wh: tuple[int, int] | None = None  # lazy ffprobe, only if keyframes used
     for n, b in enumerate(blocks):
         src_start = float(b["srcStart"])
         src_end = float(b["srcEnd"])
@@ -268,41 +389,45 @@ def run(job, report) -> dict:
         if kf:
             # ---- Slice 11: keyframed transform path (captions/titles stay
             # fixed on the canvas, applied after the overlay) ----
-            if src_wh is None:
-                src_wh = _source_wh(video)
-            vf_str = _keyframe_vf(kf, src_wh[0], src_wh[1], out_dur, speed)
+            vf_str = _keyframe_vf(kf, W, H, out_dur, speed)
             if cap_filters:
                 vf_str += "," + ",".join(cap_filters)
+            vf_str += ",fps=30,settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
         else:
-            # ---- original path (unchanged) ----
-            vf = [f"setpts=PTS/{speed}"] + cap_filters
+            # ---- original path + Slice 12 normalization ----
+            vf = [f"setpts=PTS/{speed}", norm_tail] + cap_filters
             vf_str = ",".join(vf)
 
-        af = [f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11"]
+        # Slice 12: every segment carries an audio stream so acrossfade's
+        # filter graph is uniform. Muted = silent audio, not dropped stream.
+        af = "volume=0" if muted else f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11"
         out = project_dir(pid) / f"edl_seg_{n}.mp4"
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-               "-ss", str(src_start), "-to", str(src_end), "-i", str(video),
-               "-vf", vf_str, "-c:v", "libx264", "-preset", "veryfast",
-               "-crf", "20"]
-        if muted:
-            cmd += ["-an"]
-        else:
-            cmd += ["-af", ",".join(af), "-c:a", "aac"]
-        cmd.append(str(out))
+               "-ss", str(src_start), "-to", str(src_end), "-i", str(video)]
+        if not has_audio:
+            # synthesize silence matching the segment's source span; the -af
+            # chain (atempo/volume) then shapes it exactly like real audio
+            cmd += ["-f", "lavfi", "-i",
+                    f"anullsrc=r=48000:cl=stereo:d={(src_end - src_start):.3f}",
+                    "-map", "0:v:0", "-map", "1:a:0"]
+        cmd += ["-vf", vf_str, "-af", af,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", str(out)]
         subprocess.run(cmd, check=True)
         seg_files.append(str(out))
+        seg_durs.append(out_dur)
+        kept_blocks.append(b)
         edit_cursor += (src_end - src_start) / speed
         report(0.1 + 0.8 * (n + 1) / total)
 
     if not seg_files:
         raise RuntimeError("all blocks were empty")
 
-    lst = project_dir(pid) / "edl_list.txt"
-    lst.write_text("".join(f"file '{p}'\n" for p in seg_files))
+    # ---- Slice 12: transitions at joins (transition on left block of join) ----
+    joins = [_clean_transition(kept_blocks[i].get("transition"), seg_durs[i], seg_durs[i + 1])
+             for i in range(len(kept_blocks) - 1)]
+    join_path, expected_dur = _join_segments(ffmpeg, pid, seg_files, seg_durs, joins)
     out = project_dir(pid) / "edit.mp4"
-    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                    "-f", "concat", "-safe", "0", "-i", str(lst),
-                    "-c", "copy", str(out)], check=True)
     for p in seg_files:
         try:
             os.unlink(p)
@@ -317,8 +442,10 @@ def run(job, report) -> dict:
     out_dur = round(float(pr.stdout.strip()), 1)
 
     edl = {"blocks": blocks, "output_duration": out_dur,
-           "captions": captions, "titles": titles}
+           "captions": captions, "titles": titles,
+           "transitions": sum(1 for j in joins if j), "join_path": join_path}
     save_json(pid, "edit_edl.json", edl)
     report(1.0)
     return {"file": out.name, "blocks": len(blocks),
-            "output_duration": out_dur, "titles": len(titles)}
+            "output_duration": out_dur, "titles": len(titles),
+            "transitions": edl["transitions"], "join_path": join_path}

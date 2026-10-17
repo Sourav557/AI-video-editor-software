@@ -3,6 +3,7 @@ import { api, fmtTC, fmtTime, JobStatus, Segment, Silence } from './api'
 import Timeline, {
   Block, blockDur, layoutBlocks, newId,
   Kf, KfProp, Keyframes, KF_DEFAULTS, emptyKeyframes, kfVal, kfTransform,
+  Transition, TRANSITION_TYPES, clampTransitionDur,
 } from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
@@ -577,6 +578,41 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                              onChange={(e) => updateSelected({ muted: e.target.checked })} />
                       Mute this clip
                     </label>
+                    {(() => {
+                      const idx = blocks.findIndex((b) => b.id === selected.id)
+                      if (idx === -1 || idx >= blocks.length - 1) return null
+                      const tr: Transition | undefined = selected.transition
+                      return (
+                        <div className="mt-2 text-xs">
+                          <div className="faint mb-1">⤨ Transition → next clip</div>
+                          <div className="flex items-center gap-2">
+                            <select
+                              value={tr?.type ?? 'none'}
+                              onChange={(e) => {
+                                const v = e.target.value
+                                updateSelected({ transition: v === 'none' ? undefined : { type: v, dur: tr?.dur ?? 0.5 } })
+                              }}
+                              className="card px-1.5 py-1 text-xs max-w-[9.5rem]">
+                              <option value="none">None (hard cut)</option>
+                              {TRANSITION_TYPES.map((t) => (
+                                <option key={t} value={t}>{t}</option>
+                              ))}
+                            </select>
+                            {tr && (
+                              <span className="flex items-center gap-1">
+                                <input type="number" min={0.1} max={2} step={0.1}
+                                       value={tr.dur}
+                                       onChange={(e) => updateSelected({
+                                         transition: { type: tr.type, dur: clampTransitionDur(Number(e.target.value)) },
+                                       })}
+                                       className="card px-1.5 py-1 text-xs w-14 tabular" />
+                                <span className="faint">s</span>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })()}
                     <KeyframesEditor
                       block={selected}
                       localNow={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}

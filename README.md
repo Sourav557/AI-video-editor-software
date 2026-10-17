@@ -54,6 +54,7 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 - [x] Slice 9 — full studio (razor/trim/reorder, undo/redo, clip properties, render_edl)
 - [x] Slice 10 — Filmora parity (filmstrip, menu bar, media bin, titles track, transport, timeline persist)
 - [x] Slice 11 — keyframed transforms (position/scale/rotation/opacity) + keyframe UI
+- [x] Slice 12 — transitions library (xfade crossfades + acrossfade audio, 14 types, timeline ⤨ markers)
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)
 - [ ] Slice 6 — editing agent + style profiles

@@ -9,7 +9,25 @@ export interface Block {
   speed: number
   muted: boolean
   keyframes?: Keyframes
+  /** Transition into the next V1 block (set on the LEFT block of a join).
+   *  Absence = hard cut. Rendered via ffmpeg xfade (+ acrossfade audio). */
+  transition?: Transition
 }
+
+/** One transition: ffmpeg xfade type + overlap duration (seconds). */
+export interface Transition { type: string; dur: number }
+
+/** ffmpeg xfade transition names offered in the UI (Slice 12). */
+export const TRANSITION_TYPES: string[] = [
+  'dissolve', 'fade', 'fadeblack', 'fadewhite',
+  'wipeleft', 'wiperight', 'wipeup', 'wipedown',
+  'slideleft', 'slideright', 'circleopen', 'circleclose',
+  'smoothleft', 'smoothright',
+]
+
+/** Clamp a transition duration to the UI/backend bounds (0.1–2.0s). */
+export const clampTransitionDur = (d: number) =>
+  Math.min(2.0, Math.max(0.1, Number.isFinite(d) ? d : 0.5))
 
 /** One keyframe: t = seconds relative to the block's output-time start
  *  (after speed is applied), v = property value at that time. */
@@ -374,6 +392,16 @@ export default function Timeline(p: Props) {
                 <div className="absolute top-0 bottom-0 w-0.5 pointer-events-none z-20"
                      style={{ left: starts[Math.min(drag.over, starts.length - 1)] * p.pxPerSec, background: 'var(--warning)' }} />
               )}
+              {/* Slice 12: transition markers on joins (pointer-events-none: drag-free) */}
+              {p.blocks.map((b, i) => (i < p.blocks.length - 1 && b.transition ? (
+                <div key={`tr-${b.id}`}
+                     className="absolute top-0 bottom-0 flex items-center pointer-events-none z-20"
+                     style={{ left: (starts[i] + blockDur(b)) * p.pxPerSec, transform: 'translateX(-50%)' }}>
+                  <span className="text-[11px] px-1 rounded" style={{ background: 'rgba(34,211,238,.85)', color: '#04121a' }}>
+                    ⤨
+                  </span>
+                </div>
+              ) : null))}
             </div>
 
             {/* A1 */}
