@@ -48,7 +48,8 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 - [x] Slice 3 — multi-platform export presets (9:16 / 16:9 / 1:1 + loudness)
 - [x] Slice 4 — Qwen3-TTS voiceover (preset voices + consent-gated voice cloning)
 - [x] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnail text)
-- [ ] Slice 6 — co-editor agent (chat → plans → calls workers; montage stitching)
+- [x] Slice 6 — co-editor agent (chat → plans → calls workers; montage stitching)
+- [ ] Slice 7 — desktop .exe (Tauri + NSIS installer, PyInstaller backend, CI-built)
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)
 - [ ] Slice 6 — editing agent + style profiles

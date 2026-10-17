@@ -1,8 +1,11 @@
 """Central configuration. Everything local; nothing phones home."""
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+# Desktop (.exe) builds pass --data-dir pointing at the user's app-data folder.
+# Plain `uvicorn` dev runs keep using backend/data/.
+DATA_DIR = Path(os.environ.get("LOCALCUT_DATA_DIR", BASE_DIR / "data"))
 PROJECTS_DIR = DATA_DIR / "projects"
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 

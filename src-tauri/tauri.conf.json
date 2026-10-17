@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:8000; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://127.0.0.1:8000; media-src 'self' blob: http://127.0.0.1:8000; connect-src 'self' http://127.0.0.1:8000"
+    },
+    "windows": [
+      {
+        "height": 860,
+        "minHeight": 700,
+        "minWidth": 1024,
+        "title": "LocalCut",
+        "width": 1280
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "npm run build --prefix ../frontend",
+    "beforeDevCommand": "npm run dev --prefix ../frontend",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../frontend/dist"
+  },
+  "bundle": {
+    "active": true,
+    "category": "Video",
+    "externalBin": [
+      "binaries/localcut-backend"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
+    "nsis": {
+      "displayLanguageSelector": false,
+      "installMode": "currentUser",
+      "languages": [
+        "English"
+      ]
+    },
+    "resources": [
+      "resources/ffmpeg"
+    ],
+    "shortDescription": "Free, fully local AI video editor",
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      }
+    }
+  },
+  "identifier": "com.localcut.app",
+  "plugins": {},
+  "productName": "LocalCut",
+  "version": "0.1.0"
+}

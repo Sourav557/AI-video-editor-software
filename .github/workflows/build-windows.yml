@@ -1,0 +1,89 @@
+# Builds the LocalCut Windows installer (.exe, NSIS with uninstaller).
+# Runs on a Windows GitHub runner because a Windows .exe cannot be produced
+# from Linux/macOS. Trigger manually (Actions tab) or by pushing a v* tag.
+#
+# What it does:
+#   1. PyInstaller -> localcut-backend.exe (FastAPI + whisper + TTS, ~2GB)
+#   2. Stages it as the Tauri sidecar
+#   3. Downloads a static ffmpeg build (bundled, no system ffmpeg needed)
+#   4. Builds the React frontend pointed at the local backend
+#   5. `tauri build` -> LocalCut_<version>_x64-setup.exe (NSIS)
+#
+# The .exe appears as a workflow artifact: Actions -> this run -> Artifacts.
+
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend deps + PyInstaller
+        run: |
+          cd backend
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build backend .exe (PyInstaller)
+        run: |
+          cd backend
+          pyinstaller localcut-backend.spec --noconfirm
+
+      - name: Stage backend as Tauri sidecar
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          Copy-Item backend/dist/localcut-backend.exe `
+            src-tauri/binaries/localcut-backend-x86_64-pc-windows-msvc.exe
+
+      - name: Bundle static ffmpeg
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/resources/ffmpeg | Out-Null
+          $zip = "$env:RUNNER_TEMP/ffmpeg.zip"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP/ffx"
+          $bin = Get-ChildItem -Path "$env:RUNNER_TEMP/ffx" -Directory | Select-Object -First 1
+          Copy-Item "$($bin.FullName)/bin/ffmpeg.exe" src-tauri/resources/ffmpeg/
+          Copy-Item "$($bin.FullName)/bin/ffprobe.exe" src-tauri/resources/ffmpeg/
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend (pointed at the local backend)
+        run: |
+          cd frontend
+          npm ci
+          $env:VITE_API_BASE = "http://127.0.0.1:8000"
+          npm run build
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build NSIS installer
+        run: |
+          cd src-tauri
+          tauri build
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalCut-Windows-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe

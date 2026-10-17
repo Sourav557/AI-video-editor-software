@@ -1,4 +1,10 @@
-/* Thin client for the LocalCut REST API (served by FastAPI on :8000). */
+/* Thin client for the LocalCut REST API.
+   Browser dev: same origin (relative URLs).
+   Tauri desktop build: frontend is built with VITE_API_BASE=http://127.0.0.1:8000
+   so calls reach the bundled Python backend. */
+
+const API_BASE: string =
+  ((import.meta as any).env?.VITE_API_BASE as string | undefined) ?? '';
 
 export interface JobStatus {
   id: string
@@ -14,7 +20,7 @@ export interface Segment { start: number; end: number; text: string }
 export interface Silence { start: number; end: number; duration: number }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(path, init)
+  const r = await fetch(API_BASE + path, init)
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`)
   return r.json() as Promise<T>
 }
