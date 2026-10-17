@@ -26,6 +26,17 @@ export interface Block {
   /** Slice 14: freeze-frame — hold the frame at source time srcStart+at as a
    *  silent still for dur seconds (inserted into the output). */
   freeze?: FreezeFrame
+  /** Slice 15: parametric EQ — up to 5 bands, rendered via ffmpeg
+   *  `equalizer` (t=q). f: 20–20000 Hz, g: −12..12 dB, w: Q 0.5–4. */
+  audio_eq?: EqBand[]
+  /** Slice 15: FFT denoise via ffmpeg `afftdn` (tuned, not defaults). */
+  audio_denoise?: boolean
+  /** Slice 15: role for ducking — 'music' beds duck under 'dialogue' clips. */
+  role?: AudioRole
+  /** Slice 15: ducking config on music-role blocks (presence = enabled).
+   *  Dips the block where its source range overlaps dialogue-marked source
+   *  ranges; depth = 1/ratio. threshold is reserved for a future sidechain. */
+  ducking?: DuckingConfig
 }
 
 /** Per-clip color grade (Slice 13). All optional; undefined = default. */
@@ -124,6 +135,25 @@ export function blockHasKeyframes(b: Block): boolean {
   const k = b.keyframes
   return !!k && (k.x.length + k.y.length + k.scale.length + k.rot.length + k.op.length) > 0
 }
+
+/** One parametric EQ band (Slice 15). f = center Hz, g = gain dB, w = Q factor. */
+export interface EqBand { f: number; g: number; w: number }
+
+/** Clip audio role (Slice 15). */
+export type AudioRole = 'music' | 'dialogue'
+
+/** Ducking config on a music-role block (Slice 15). */
+export interface DuckingConfig { threshold: number; ratio: number }
+
+/** Bounds for the EQ band editor (Slice 15). */
+export const EQ_RANGES = {
+  f: { min: 20, max: 20000, step: 1, label: 'Freq (Hz)' },
+  g: { min: -12, max: 12, step: 0.5, label: 'Gain (dB)' },
+  w: { min: 0.5, max: 4, step: 0.1, label: 'Q' },
+} as const
+
+/** Default ducking sliders (Slice 15). */
+export const DUCKING_DEFAULTS: DuckingConfig = { threshold: 0.03, ratio: 4 }
 
 /** One speed-ramp keyframe (Slice 14). t = seconds in SOURCE timebase,
  *  relative to the block's srcStart. */

@@ -10,6 +10,10 @@ Slice 14: blocks may also carry speed_ramps (piecewise-constant speed
 profile, t in source timebase), reversed (backward playback), and freeze
 (inserted silent still). Such blocks render as multiple pieces that are
 concatenated into the block's segment; the plain path is unchanged.
+Slice 15: blocks may carry audio FX — audio_eq (up to 5 parametric EQ
+bands), audio_denoise (afftdn), role ('music'/'dialogue'), and ducking
+({threshold, ratio}) on music-role blocks (volume-automation dip where the
+block's source range overlaps dialogue-marked source ranges).
 Output: edit.mp4 + edit_edl.json. Idempotent.
 """
 from __future__ import annotations
@@ -458,6 +462,128 @@ def _clean_freeze(raw, span: float) -> dict | None:
     return {"at": at, "dur": dur}
 
 
+# ---- Slice 15: audio FX (parametric EQ, denoise, ducking) ----
+# Block fields (all optional):
+#   audio_eq: [{f, g, w}] — up to 5 parametric bands (ffmpeg `equalizer`,
+#     t=q). f: 20–20000 Hz, g: -12..12 dB, w: Q factor 0.5–4.
+#   audio_denoise: bool — FFT denoise via `afftdn`. Defaults are NOT used:
+#     bare `afftdn` (noise_floor=-50) measured ~0dB reduction on test
+#     content; `afftdn=nf=-25` measured -12dB on realistic hiss with the
+#     wanted signal untouched (see Slice 15 verification).
+#   role: 'music' | 'dialogue' — marks the block's purpose.
+#   ducking: {threshold, ratio} — on a music-role block, dips its volume
+#     during the SOURCE-time ranges where dialogue-role blocks exist.
+# Per block/piece -af chain order:
+#   atempo -> equalizer... -> afftdn -> volume(duck expr) -> loudnorm
+# EQ/denoise sit BEFORE loudnorm so it measures the processed audio. The
+# ducking volume expression ALSO sits before loudnorm: loudnorm's EOF flush
+# emits the tail (~3s) as a single frame stamped with a stale pts_time, so
+# any t-based expression placed AFTER loudnorm mis-fires on the tail
+# (measured: a between(t,2,6) dip never ended). Pre-loudnorm the dip timing
+# is sample-exact; loudnorm's single-pass dynamics may soften the depth a
+# little (measured -10.6dB for a -12dB setting — still well past the 6dB
+# bar). Muted blocks keep the old `volume=0` and skip all FX (pointless on
+# silence).
+# Design note (ducking = Option B, volume automation): the timeline
+# concatenates blocks — nothing ever plays simultaneously — so a true
+# sidechain compressor has nothing to key on. Instead the music block is
+# dipped where its source range overlaps dialogue-marked source ranges,
+# expressed as a volume eval=frame expression over the block's local output
+# time `t` (piece-local in the Slice-14 multi-piece path). `threshold` is
+# sanitized and stored but has no function in volume-automation mode; it is
+# reserved for a future sidechain implementation. Dip depth = 1/ratio.
+
+
+def _clean_eq(raw) -> list[dict] | None:
+    """Sanitize block['audio_eq'] -> [{f, g, w}] (max 5 bands) or None."""
+    if not isinstance(raw, list):
+        return None
+    bands: list[dict] = []
+    for e in raw:
+        if not isinstance(e, dict) or len(bands) >= 5:
+            continue
+        try:
+            f = min(20000.0, max(20.0, float(e.get("f", 1000.0))))
+            g = min(12.0, max(-12.0, float(e.get("g", 0.0))))
+            w = min(4.0, max(0.5, float(e.get("w", 1.0))))
+        except (TypeError, ValueError):
+            continue
+        bands.append({"f": f, "g": g, "w": w})
+    return bands or None
+
+
+def _eq_af(bands: list[dict] | None) -> list[str]:
+    """ffmpeg `equalizer` filters for sanitized EQ bands."""
+    return [f"equalizer=f={b['f']:g}:t=q:w={b['w']:g}:g={b['g']:g}"
+            for b in (bands or [])]
+
+
+def _clean_role(raw) -> str | None:
+    return raw if raw in ("music", "dialogue") else None
+
+
+def _clean_ducking(raw) -> dict | None:
+    """Sanitize block['ducking'] -> {threshold, ratio} or None.
+
+    Presence of the dict = enabled; an explicit enabled:false disables.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("enabled") is False:
+        return None
+    try:
+        threshold = min(0.5, max(0.02, float(raw.get("threshold", 0.03))))
+        ratio = min(20.0, max(2.0, float(raw.get("ratio", 4.0))))
+    except (TypeError, ValueError):
+        return None
+    return {"threshold": threshold, "ratio": ratio}
+
+
+def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge overlapping/adjacent (a, b) ranges, sorted."""
+    out: list[tuple[float, float]] = []
+    for a, b in sorted(ranges):
+        if b - a <= 1e-9:
+            continue
+        if out and a <= out[-1][1] + 1e-9:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _duck_af(ranges: list[tuple[float, float]], dip: float) -> list[str]:
+    """volume filter dipping to `dip` during local-output-time `ranges`.
+
+    Commas are pre-escaped (\\,) for embedding in the -af option string,
+    the same convention as Slice 11's keyframe expressions.
+    """
+    if not ranges or not (0.0 < dip < 1.0):
+        return []
+    cond = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in ranges)
+    return [f"volume='if({cond}\\,{_fmt_num(dip)}\\,1)':eval=frame"]
+
+
+def _piece_duck_ranges(duck_src: list[tuple[float, float]],
+                       s0: float, s1: float, v: float,
+                       reversed_: bool) -> list[tuple[float, float]]:
+    """Map block source-relative duck ranges into one piece's local output time.
+
+    (s0, s1) is the piece's source-relative span at speed v; when reversed,
+    source s1 plays at piece-local t=0.
+    """
+    out: list[tuple[float, float]] = []
+    for lo, hi in duck_src:
+        a, c = max(lo, s0), min(hi, s1)
+        if c - a <= 1e-9:
+            continue
+        if reversed_:
+            out.append(((s1 - c) / v, (s1 - a) / v))
+        else:
+            out.append(((a - s0) / v, (c - s0) / v))
+    return out
+
+
 def _source_audio_params(video) -> tuple[int, str] | None:
     """(sample_rate, channel_layout) of the source's first audio stream, or None."""
     ffprobe = shutil.which("ffprobe")
@@ -519,13 +645,19 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
                       muted: bool, reversed_: bool,
                       kf: dict | None, color_vf: list[str],
                       srt_text: str | None, title_fs: list[str],
-                      out_path, piece_dur: float, seg_tag: str) -> None:
+                      out_path, piece_dur: float, seg_tag: str,
+                      fx_af: list[str] | None = None,
+                      duck_af: list[str] | None = None) -> None:
     """Render one source-span piece of a Slice-14 block.
 
     Same trim/speed/color/normalize/caption chain as the old path, with
     `reverse` before setpts and `areverse` before atempo when reversed.
     Identical WxH/fps/pix_fmt/codec to every other piece so the block-level
     concat (-c copy) and the join stage keep working.
+    Slice 15: `fx_af` (equalizer/afftdn filters) goes between atempo and
+    loudnorm; `duck_af` (volume expression, piece-local t) goes after the
+    FX but before loudnorm (t-based expressions must precede loudnorm —
+    see module docstring).
     """
     vf_pre = ["reverse"] if reversed_ else []
     if kf:
@@ -540,8 +672,12 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
     if title_fs:
         vf_str += "," + ",".join(title_fs)
     af_pre = "areverse," if reversed_ else ""
+    # Slice 15: EQ/denoise, then the ducking volume expression, then
+    # loudnorm (volume must precede loudnorm — see module docstring).
     af_core = (f"{_atempo(speed)},volume=0" if muted
-               else f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11")
+               else ",".join([_atempo(speed), *(fx_af or []),
+                              *(duck_af or []),
+                              "loudnorm=I=-14:TP=-1.0:LRA=11"]))
     af = af_pre + af_core
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
            "-ss", str(s0_abs), "-to", str(s1_abs), "-i", str(video)]
@@ -633,6 +769,39 @@ def run(job, report) -> dict:
     t = load_json(pid, "transcript.json") or {}
     words = t.get("words", [])
 
+    # ---- Slice 15: layout pre-pass. Ducking maps dialogue ranges (source
+    # timebase) into each music block's local output time, so the full edit
+    # layout must be known before any block renders. The loop below iterates
+    # `layout` instead of `blocks`; empty blocks are skipped identically. ----
+    layout: list[dict] = []
+    _cur = 0.0
+    for n, b in enumerate(blocks):
+        src_start = float(b["srcStart"])
+        src_end = float(b["srcEnd"])
+        if src_end <= src_start:
+            continue
+        span = src_end - src_start
+        speed = min(4.0, max(0.25, float(b.get("speed", 1.0))))
+        ramps = _clean_ramps(b.get("speed_ramps"), span, speed)
+        freeze = _clean_freeze(b.get("freeze"), span)
+        reversed_ = bool(b.get("reversed", False))
+        ramp_spans = ramps if ramps else [(0.0, span, speed)]
+        out_dur = (sum((b1 - b0) / v for b0, b1, v in ramp_spans)
+                   + (freeze["dur"] if freeze else 0.0))
+        layout.append({"n": n, "b": b, "src_start": src_start,
+                       "src_end": src_end, "span": span, "speed": speed,
+                       "ramps": ramps, "freeze": freeze,
+                       "reversed": reversed_, "out_dur": out_dur,
+                       "edit_start": _cur})
+        _cur += out_dur
+
+    # Slice 15: dialogue source ranges (absolute source timebase, merged) —
+    # the ducking reference. Muted dialogue blocks are silent: excluded.
+    dialogue_src = _merge_ranges([
+        (L["src_start"], L["src_end"]) for L in layout
+        if _clean_role(L["b"].get("role")) == "dialogue"
+        and not L["b"].get("muted", False)])
+
     # Slice 12: all segments must be xfade-compatible — identical WxH,
     # fps, pix_fmt and timebase. Normalize everything to the project canvas.
     proj_wh = _source_wh(video)
@@ -645,28 +814,36 @@ def run(job, report) -> dict:
     seg_files: list[str] = []
     seg_durs: list[float] = []
     kept_blocks: list[dict] = []
-    total = len(blocks)
     edit_cursor = 0.0  # position in the final (edit timebase) video
     # Slice 14: freeze stills need silent audio matching the source's params
     # so the block-level -c copy concat stays uniform.
     src_audio = _source_audio_params(video) if has_audio else None
-    for n, b in enumerate(blocks):
-        src_start = float(b["srcStart"])
-        src_end = float(b["srcEnd"])
-        speed = min(4.0, max(0.25, float(b.get("speed", 1.0))))
+    for li, L in enumerate(layout):
+        b = L["b"]
+        n = L["n"]
+        src_start, src_end = L["src_start"], L["src_end"]
+        span, speed = L["span"], L["speed"]
+        ramps, freeze, reversed_ = L["ramps"], L["freeze"], L["reversed"]
+        out_dur = L["out_dur"]
         muted = bool(b.get("muted", False))
-        if src_end <= src_start:
-            continue
-        span = src_end - src_start
-        # ---- Slice 14: ramps / reverse / freeze ----
-        ramps = _clean_ramps(b.get("speed_ramps"), span, speed)
-        freeze = _clean_freeze(b.get("freeze"), span)
-        reversed_ = bool(b.get("reversed", False))
         s14 = bool(ramps) or freeze is not None or reversed_
-        ramp_spans = ramps if ramps else [(0.0, span, speed)]
-        out_dur = (sum((b1 - b0) / v for b0, b1, v in ramp_spans)
-                   + (freeze["dur"] if freeze else 0.0))
         kf = _clean_keyframes(b.get("keyframes"), out_dur)
+        # ---- Slice 15: per-block audio FX ----
+        fx_af = _eq_af(_clean_eq(b.get("audio_eq")))
+        if b.get("audio_denoise"):
+            # nf=-25, not defaults: measured -12dB hiss reduction vs ~0dB
+            # with bare afftdn (see module docstring).
+            fx_af.append("afftdn=nf=-25")
+        duck_cfg = (_clean_ducking(b.get("ducking"))
+                    if _clean_role(b.get("role")) == "music" and not muted else None)
+        duck_dip = 1.0 / duck_cfg["ratio"] if duck_cfg else 0.0
+        # dialogue overlap in this block's source-relative timebase [0, span]
+        duck_src: list[tuple[float, float]] = []
+        if duck_cfg and dialogue_src:
+            for a, c in dialogue_src:
+                lo, hi = max(a, src_start) - src_start, min(c, src_end) - src_start
+                if hi - lo > 1e-3:
+                    duck_src.append((lo, hi))
         color_vf = _color_vf(_clean_color(b.get("color")), b.get("lut"))
         out = project_dir(pid) / f"edl_seg_{n}.mp4"
 
@@ -708,11 +885,15 @@ def run(job, report) -> dict:
                         pid, _titles_for_block(titles, edit_cursor + piece_offset))
                     pkf = (_clean_keyframes(b.get("keyframes"), pdur)
                            if b.get("keyframes") else None)
+                    # Slice 15: piece-local duck ranges (s0/s1 are
+                    # source-relative; reversed pieces mirror them).
+                    p_duck = (_duck_af(_piece_duck_ranges(duck_src, s0, s1, v, reversed_),
+                                       duck_dip) if duck_cfg else [])
                     _render_seg_piece(ffmpeg, pid, video, has_audio, W, H, norm_tail,
                                       src_start + s0, src_start + s1, v,
                                       muted, reversed_, pkf, color_vf,
                                       srt_text, title_fs, pf, pdur,
-                                      f"edl_seg_{n}_p{m}")
+                                      f"edl_seg_{n}_p{m}", fx_af, p_duck)
                     piece_offset += pdur
                 piece_files.append(str(pf))
             lst = project_dir(pid) / f"edl_seg_{n}_pieces.txt"
@@ -735,7 +916,7 @@ def run(job, report) -> dict:
             seg_durs.append(out_dur)
             kept_blocks.append(b)
             edit_cursor += out_dur
-            report(0.1 + 0.8 * (n + 1) / total)
+            report(0.1 + 0.8 * (li + 1) / max(1, len(layout)))
             continue
 
         srt_path = None
@@ -764,7 +945,15 @@ def run(job, report) -> dict:
 
         # Slice 12: every segment carries an audio stream so acrossfade's
         # filter graph is uniform. Muted = silent audio, not dropped stream.
-        af = "volume=0" if muted else f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11"
+        # Slice 15: EQ/denoise, then ducking volume, then loudnorm (volume
+        # must precede loudnorm — its EOF flush breaks t-based expressions).
+        if muted:
+            af = "volume=0"
+        else:
+            duck_local = [(lo / speed, hi / speed) for lo, hi in duck_src]
+            af = ",".join([_atempo(speed), *fx_af,
+                           *_duck_af(duck_local, duck_dip),
+                           "loudnorm=I=-14:TP=-1.0:LRA=11"])
         out = project_dir(pid) / f"edl_seg_{n}.mp4"
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-ss", str(src_start), "-to", str(src_end), "-i", str(video)]
@@ -782,7 +971,7 @@ def run(job, report) -> dict:
         seg_durs.append(out_dur)
         kept_blocks.append(b)
         edit_cursor += out_dur  # == (src_end - src_start) / speed on the old path
-        report(0.1 + 0.8 * (n + 1) / total)
+        report(0.1 + 0.8 * (li + 1) / max(1, len(layout)))
 
     if not seg_files:
         raise RuntimeError("all blocks were empty")
@@ -810,7 +999,11 @@ def run(job, report) -> dict:
            "transitions": sum(1 for j in joins if j), "join_path": join_path,
            "ramps": sum(1 for x in blocks if x.get("speed_ramps")),
            "reversed": sum(1 for x in blocks if x.get("reversed")),
-           "freezes": sum(1 for x in blocks if x.get("freeze"))}
+           "freezes": sum(1 for x in blocks if x.get("freeze")),
+           "eq": sum(1 for x in blocks if x.get("audio_eq")),
+           "denoise": sum(1 for x in blocks if x.get("audio_denoise")),
+           "ducking": sum(1 for x in blocks
+                           if x.get("role") == "music" and x.get("ducking"))}
     save_json(pid, "edit_edl.json", edl)
     report(1.0)
     return {"file": out.name, "blocks": len(blocks),

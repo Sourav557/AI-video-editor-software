@@ -6,6 +6,7 @@ import Timeline, {
   Transition, TRANSITION_TYPES, clampTransitionDur,
   BlockColor, COLOR_DEFAULTS, COLOR_RANGES, COLOR_PRESETS,
   SpeedRamp, rampSpans, blockOutToSrc,
+  EqBand, AudioRole, DuckingConfig, EQ_RANGES, DUCKING_DEFAULTS,
 } from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
@@ -286,6 +287,141 @@ function TimeFXPanel({ block, localOut, onChange }: {
           <span className="faint">s</span>
           <button className="text-[11px] px-2 py-1 rounded card hover:text-white"
                   onClick={addFreezeAtPlayhead}>❄ Freeze at playhead</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Slice 15: parametric EQ + denoise + role/ducking editor for the selected clip.
+ *  EQ bands render via ffmpeg `equalizer` (t=q); ducking dips a music-role
+ *  block where its source range overlaps dialogue-marked source ranges. */
+function AudioFXPanel({ block, onChange, onCommit }: {
+  block: Block
+  onChange: (patch: Partial<Block>, transient?: boolean) => void
+  onCommit: () => void
+}) {
+  const bands = block.audio_eq ?? []
+  const setBand = (i: number, key: keyof EqBand, v: number) => {
+    const r = EQ_RANGES[key]
+    const cv = Math.min(r.max, Math.max(r.min, Number.isFinite(v) ? v : 0))
+    onChange({ audio_eq: bands.map((b, j) => (j === i ? { ...b, [key]: cv } : b)) }, true)
+  }
+  const addBand = () => {
+    if (bands.length >= 5) return
+    onChange({ audio_eq: [...bands, { f: 1000, g: 0, w: 1 }] })
+  }
+  const removeBand = (i: number) => {
+    const next = bands.filter((_, j) => j !== i)
+    onChange({ audio_eq: next.length ? next : undefined })
+  }
+  const setRole = (r: string) => {
+    const patch: Partial<Block> = { role: (r as AudioRole) || undefined }
+    if (r !== 'music') {
+      patch.ducking = undefined
+    } else if (!block.ducking) {
+      patch.ducking = { ...DUCKING_DEFAULTS }
+    }
+    onChange(patch)
+  }
+  const duck = block.ducking
+  const setDuck = (key: keyof DuckingConfig, v: number) => {
+    const lo = key === 'threshold' ? 0.02 : 2
+    const hi = key === 'threshold' ? 0.5 : 20
+    const cv = Math.min(hi, Math.max(lo, Number.isFinite(v) ? v : DUCKING_DEFAULTS[key]))
+    onChange({ ducking: { ...(duck ?? DUCKING_DEFAULTS), [key]: cv } }, true)
+  }
+  const hasFX = bands.length > 0 || !!block.audio_denoise || block.role !== undefined
+  const reset = () => onChange({ audio_eq: undefined, audio_denoise: undefined, role: undefined, ducking: undefined })
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-semibold text-xs" style={{ color: 'var(--cyan)' }}>AUDIO</div>
+        {hasFX && (
+          <button className="text-[10px] faint hover:text-white" title="Clear all audio FX"
+                  onClick={reset}>Reset</button>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 text-xs mb-2">
+        <span className="faint w-24 shrink-0">Role</span>
+        <select value={block.role ?? ''}
+                onChange={(e) => setRole(e.target.value)}
+                className="card px-1.5 py-1 text-xs flex-1"
+                title="Mark the clip's purpose — music beds duck under dialogue clips">
+          <option value="">None</option>
+          <option value="dialogue">Dialogue</option>
+          <option value="music">Music bed</option>
+        </select>
+      </div>
+
+      <div className="faint text-[11px] mb-1">Parametric EQ <span className="opacity-70">(up to 5 bands)</span></div>
+      {bands.map((b, i) => (
+        <div key={i} className="mb-2 rounded-lg p-2" style={{ background: 'var(--surface-2)' }}>
+          <div className="flex items-center gap-2 text-xs mb-1.5">
+            <span className="font-semibold">Band {i + 1}</span>
+            <button className="text-[11px] faint hover:text-white ml-auto" title="Remove band"
+                    onClick={() => removeBand(i)}>✕</button>
+          </div>
+          <div className="flex items-center gap-2 text-xs mb-1.5">
+            <span className="w-16 shrink-0 faint">{EQ_RANGES.f.label}</span>
+            <input type="number" min={EQ_RANGES.f.min} max={EQ_RANGES.f.max} step={EQ_RANGES.f.step}
+                   value={Math.round(b.f)}
+                   onChange={(e) => setBand(i, 'f', Number(e.target.value))}
+                   onBlur={onCommit}
+                   className="card px-1.5 py-1 text-xs w-24 tabular" />
+          </div>
+          {(['g', 'w'] as (keyof EqBand)[]).map((key) => {
+            const r = EQ_RANGES[key]
+            return (
+              <div key={key} className="flex items-center gap-2 text-xs mb-1.5">
+                <span className="w-16 shrink-0 faint">{r.label}</span>
+                <input type="range" min={r.min} max={r.max} step={r.step} value={b[key]} className="flex-1"
+                       onChange={(e) => setBand(i, key, Number(e.target.value))}
+                       onPointerUp={onCommit} onBlur={onCommit} />
+                <span className="tabular w-12 text-right">{key === 'g' ? `${b[key] > 0 ? '+' : ''}${b[key].toFixed(1)}` : b[key].toFixed(1)}</span>
+              </div>
+            )
+          })}
+        </div>
+      ))}
+      {bands.length < 5 && (
+        <button className="text-[11px] px-2 py-1 rounded card hover:text-white mb-1"
+                onClick={addBand}>＋ EQ band</button>
+      )}
+
+      <label className="flex items-center gap-2 mt-2 text-xs">
+        <input type="checkbox" checked={!!block.audio_denoise}
+               onChange={(e) => onChange({ audio_denoise: e.target.checked || undefined })} />
+        Denoise <span className="faint">(FFT hiss reduction)</span>
+      </label>
+
+      {block.role === 'music' && (
+        <div className="mt-2 rounded-lg p-2" style={{ background: 'var(--surface-2)' }}>
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={!!duck}
+                   onChange={(e) => onChange({ ducking: e.target.checked ? { ...DUCKING_DEFAULTS } : undefined })} />
+            Duck under dialogue
+          </label>
+          {duck && (
+            <div className="mt-2">
+              <div className="faint text-[10px] mb-1">Dips this clip where its audio overlaps dialogue-marked clips.</div>
+              <div className="flex items-center gap-2 text-xs mb-1.5">
+                <span className="w-20 shrink-0 faint">Threshold</span>
+                <input type="range" min={0.02} max={0.5} step={0.01} value={duck.threshold} className="flex-1"
+                       onChange={(e) => setDuck('threshold', Number(e.target.value))}
+                       onPointerUp={onCommit} onBlur={onCommit} />
+                <span className="tabular w-10 text-right">{duck.threshold.toFixed(2)}</span>
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span className="w-20 shrink-0 faint">Ratio</span>
+                <input type="range" min={2} max={20} step={0.5} value={duck.ratio} className="flex-1"
+                       onChange={(e) => setDuck('ratio', Number(e.target.value))}
+                       onPointerUp={onCommit} onBlur={onCommit} />
+                <span className="tabular w-10 text-right">{duck.ratio.toFixed(1)}:1</span>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -748,6 +884,12 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                       block={selected}
                       localOut={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}
                       onChange={(patch) => updateSelected(patch)}
+                    />
+                    <AudioFXPanel
+                      key={`audio-${selected.id}`}
+                      block={selected}
+                      onChange={(patch, transient) => updateSelected(patch, transient)}
+                      onCommit={() => commit(blocks)}
                     />
                     {(() => {
                       const idx = blocks.findIndex((b) => b.id === selected.id)
