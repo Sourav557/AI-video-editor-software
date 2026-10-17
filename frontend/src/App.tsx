@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmtTime, JobStatus, Segment, Silence } from './api'
+import VoiceStudio from './VoiceStudio'
 
 type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'analyzed' | 'error'
 
@@ -160,7 +161,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 3: Multi-platform export</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 4: Voice studio</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -309,7 +310,7 @@ export default function App() {
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 2 of the roadmap — next: multi-platform export presets, then Qwen3-TTS voiceover. Nothing leaves your machine.
+          Slice 4 of the roadmap — next: SEO/packaging engine, then the editing agent. Nothing leaves your machine.
         </footer>
       </main>
     </div>

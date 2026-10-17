@@ -1,4 +1,7 @@
-# Slice 1 dependencies — all free, all local
+# Slice 1-4 dependencies — all free, all local
+# CPU-only PyTorch wheels (CUDA users: install torch from the CUDA index instead)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
@@ -7,3 +10,9 @@ faster-whisper>=1.0.0
 # kwarg that faster-whisper's audio decoder requires.
 av>=12,<19
 pydantic>=2.0
+# Slice 4: Qwen3-TTS (Apache-2.0) voiceover + voice cloning
+# hf_transfer: fast parallel HF downloads (also helps on slow links)
+hf_transfer
+qwen-tts
+torch
+soundfile

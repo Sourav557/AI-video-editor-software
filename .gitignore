@@ -11,11 +11,13 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 
-# Models (large, re-downloadable)
+# Models (large, re-downloadable — never commit weights)
 *.pt
 *.bin
 *.onnx
 *.gguf
+*.safetensors
+backend/models/
 
 # OS / editors
 .DS_Store

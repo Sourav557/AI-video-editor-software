@@ -49,6 +49,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clip_index: idx, platform }),
     }),
+  ttsVoices: () =>
+    req<{ engine: string; speakers: { name: string; description: string; native: string }[]; languages: string[] }>(`/api/tts/voices`),
+  ttsGenerate: (pid: string, body: { text: string; speaker: string; language: string; instruct: string }) =>
+    req<{ tts_job: string }>(`/api/projects/${pid}/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  ttsClone: (pid: string, text: string, refText: string, language: string, refFile: File, consent: boolean) => {
+    const fd = new FormData()
+    fd.append('text', text)
+    fd.append('ref_text', refText)
+    fd.append('language', language)
+    fd.append('consent', String(consent))
+    fd.append('ref_audio', refFile)
+    return req<{ tts_job: string }>(`/api/projects/${pid}/tts/clone`, { method: 'POST', body: fd })
+  },
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

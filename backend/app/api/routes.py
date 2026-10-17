@@ -1,13 +1,14 @@
 """REST API — the same surface the future agent, MCP server, and UI all use."""
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from ..orchestrator.queue import orchestrator
 from ..platforms import PRESET_VERSION, PRESETS
 from ..projects import (get_video_path, load_json, new_project, project_dir,
                         project_exists, save_upload)
+from ..workers.tts import LANGUAGES, SPEAKERS
 
 router = APIRouter(prefix="/api")
 
@@ -151,3 +152,78 @@ def export_file(pid: str, filename: str):
     if not path.exists():
         raise HTTPException(404, "export not ready yet")
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+# ---- Slice 4: Qwen3-TTS voice studio ----
+
+@router.get("/tts/voices")
+def tts_voices():
+    return {
+        "engine": "Qwen3-TTS 0.6B (Apache-2.0)",
+        "speakers": [{"name": n, "description": d, "native": lang}
+                     for n, d, lang in SPEAKERS],
+        "languages": LANGUAGES,
+    }
+
+
+@router.post("/projects/{pid}/tts")
+def tts_generate(pid: str, body: dict):
+    """Preset-speaker voiceover. Body: {text, speaker, language, instruct}."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(400, "text is required")
+    speaker = body.get("speaker", "Ryan")
+    if speaker not in [s[0] for s in SPEAKERS]:
+        raise HTTPException(400, "unknown speaker")
+    job = orchestrator.submit("tts", pid, priority=10, params={
+        "mode": "custom", "text": text, "speaker": speaker,
+        "language": body.get("language", "English"),
+        "instruct": body.get("instruct", "") or "",
+    })
+    return {"tts_job": job.id}
+
+
+@router.post("/projects/{pid}/tts/clone")
+def tts_clone(pid: str, text: str = Form(...), ref_text: str = Form(...),
+              language: str = Form("English"), consent: bool = Form(False),
+              ref_audio: UploadFile = File(...)):
+    """Voice cloning from a 3s+ reference clip. Consent is mandatory."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not consent:
+        raise HTTPException(400, "voice cloning requires explicit consent")
+    if not text.strip() or not ref_text.strip():
+        raise HTTPException(400, "text and ref_text are required")
+    dest = project_dir(pid) / f"voice_ref_{uuid4hex()}{_safe_ext(ref_audio.filename)}"
+    with open(dest, "wb") as f:
+        f.write(ref_audio.file.read())
+    job = orchestrator.submit("tts", pid, priority=10, params={
+        "mode": "clone", "text": text.strip(), "language": language,
+        "ref_audio": str(dest), "ref_text": ref_text.strip(), "consent": True,
+    })
+    return {"tts_job": job.id}
+
+
+def uuid4hex() -> str:
+    import uuid
+    return uuid.uuid4().hex[:8]
+
+
+def _safe_ext(filename: str | None) -> str:
+    ext = (filename or "").rsplit(".", 1)[-1].lower() if "." in (filename or "") else ""
+    return f".{ext}" if ext in {"wav", "mp3", "m4a", "ogg", "flac"} else ".wav"
+
+
+@router.get("/projects/{pid}/tts/{filename}")
+def tts_file(pid: str, filename: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not filename.startswith("tts_") or not filename.endswith(".wav") \
+            or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "invalid filename")
+    path = project_dir(pid) / filename
+    if not path.exists():
+        raise HTTPException(404, "voiceover not ready yet")
+    return FileResponse(path, media_type="audio/wav", filename=filename)
