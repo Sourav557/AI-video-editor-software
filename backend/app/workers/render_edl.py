@@ -1,9 +1,11 @@
-"""Worker: render_edl — render the user's timeline edit (Slice 9).
+"""Worker: render_edl — render the user's timeline edit (Slice 9, keyframes in Slice 11).
 
 Takes an explicit block list (the Filmora-style timeline state):
-  blocks: [{id, srcStart, srcEnd, speed, muted}]
+  blocks: [{id, srcStart, srcEnd, speed, muted, keyframes?}]
 Renders each block (trim + speed + optional mute + caption burn with
 speed-scaled timestamps), concatenates, normalizes loudness.
+Blocks with keyframes render on a transparent canvas with per-frame
+scale / rotation / x-y offset / opacity, then overlay centered.
 Output: edit.mp4 + edit_edl.json. Idempotent.
 """
 from __future__ import annotations
@@ -78,6 +80,107 @@ def _font_file() -> str | None:
     return next((c for c in cands if os.path.exists(c)), None)
 
 
+# ---- Slice 11: keyframed transforms (x, y, scale, rot, op) ----
+# Keyframe times are seconds relative to the block's output-time start
+# (after speed is applied), matching the `t` the ffmpeg filters see.
+
+_KF_PROPS = ("x", "y", "scale", "rot", "op")
+_KF_DEFAULTS = {"x": 0.0, "y": 0.0, "scale": 1.0, "rot": 0.0, "op": 1.0}
+
+
+def _fmt_num(v: float) -> str:
+    s = f"{float(v):.6f}"
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def _clean_keyframes(raw, dur: float) -> dict | None:
+    """Sanitize block['keyframes'] -> {prop: [(t, v), ...]} or None.
+
+    Times clamped to [0, dur], sorted, deduped (last wins). op clamped to
+    [0, 1], scale floored at 0.01. Returns None when nothing usable.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for prop in _KF_PROPS:
+        ks = raw.get(prop) or []
+        if not isinstance(ks, list):
+            continue
+        seen: dict[float, float] = {}
+        for k in ks:
+            if not isinstance(k, dict):
+                continue
+            try:
+                t = min(max(float(k.get("t", 0.0)), 0.0), dur)
+                v = float(k.get("v", _KF_DEFAULTS[prop]))
+            except (TypeError, ValueError):
+                continue
+            if prop == "op":
+                v = min(max(v, 0.0), 1.0)
+            elif prop == "scale":
+                v = max(v, 0.01)
+            seen[round(t, 3)] = v
+        if seen:
+            out[prop] = sorted(seen.items())
+    return out or None
+
+
+def _pw_expr(pts: list[tuple[float, float]] | None, default: float,
+             t_var: str = "t") -> str:
+    """Nested if() chain: linear interpolation between keyframes in `t_var`.
+
+    Before the first keyframe holds the first value, after the last holds
+    the last. Commas are pre-escaped (\\,) for embedding in -vf strings.
+    """
+    ks = sorted(pts or [], key=lambda p: p[0])
+    if not ks:
+        return _fmt_num(default)
+    expr = _fmt_num(ks[-1][1])
+    for (t0, v0), (t1, v1) in reversed(list(zip(ks, ks[1:]))):
+        t0s, t1s, v0s, v1s = _fmt_num(t0), _fmt_num(t1), _fmt_num(v0), _fmt_num(v1)
+        seg = v1s if abs(t1 - t0) < 1e-9 else \
+            f"{v0s}+({v1s}-{v0s})*({t_var}-{t0s})/({t1s}-{t0s})"
+        expr = f"if(lt({t_var}\\,{t1s})\\,{seg}\\,{expr})"
+    return f"if(lt({t_var}\\,{_fmt_num(ks[0][0])})\\,{_fmt_num(ks[0][1])}\\,{expr})"
+
+
+def _source_wh(video) -> tuple[int, int]:
+    """Source video dimensions (ffprobe, once per render job)."""
+    ffprobe = shutil.which("ffprobe")
+    pr = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height",
+                         "-of", "csv=p=0", str(video)],
+                        capture_output=True, text=True, check=True)
+    w, h = pr.stdout.strip().split(",")[:2]
+    return int(w), int(h)
+
+
+def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
+    """-vf string for a keyframed block.
+
+    Renders the clip on a transparent WxH canvas: per-frame scale / rotate /
+    opacity (geq alpha), then overlays centered plus the x/y offset.
+    `t` is segment-local (starts at 0 after setpts).
+    """
+    SX = _pw_expr(kf.get("scale"), 1.0, "t")
+    ROT = _pw_expr(kf.get("rot"), 0.0, "t")
+    XX = _pw_expr(kf.get("x"), 0.0, "t")
+    YY = _pw_expr(kf.get("y"), 0.0, "t")
+    # geq's timestamp variable is T (colorchannelmixer's aa rejects `t`)
+    AA = _pw_expr(kf.get("op"), 1.0, "T")
+    fg = ",".join([
+        f"setpts=PTS/{speed}",
+        f"scale=iw*({SX}):ih*({SX}):eval=frame",
+        f"rotate=a=({ROT})*PI/180:fillcolor=black@0",
+        "format=rgba",
+        f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='p(X,Y)*({AA})'[fg]",
+    ])
+    bg = f"color=c=black@0:s={W}x{H}:d={dur:.3f}:r=30[bg]"
+    ov = (f"[bg][fg]overlay=x=(W-w)/2+({XX}):y=(H-h)/2+({YY})"
+          f":eof_action=pass,format=yuv420p")
+    return f"{fg};{bg};{ov}"
+
+
 def _titles_for_block(titles: list[dict], edit_cursor: float) -> list[dict]:
     """Titles overlapping this block, shifted into the block's local time."""
     out = []
@@ -138,6 +241,7 @@ def run(job, report) -> dict:
     seg_files = []
     total = len(blocks)
     edit_cursor = 0.0  # position in the final (edit timebase) video
+    src_wh: tuple[int, int] | None = None  # lazy ffprobe, only if keyframes used
     for n, b in enumerate(blocks):
         src_start = float(b["srcStart"])
         src_end = float(b["srcEnd"])
@@ -145,9 +249,11 @@ def run(job, report) -> dict:
         muted = bool(b.get("muted", False))
         if src_end <= src_start:
             continue
+        out_dur = (src_end - src_start) / speed
+        kf = _clean_keyframes(b.get("keyframes"), out_dur)
 
-        vf = [f"setpts=PTS/{speed}"]
         srt_path = None
+        cap_filters: list[str] = []
         if captions and words:
             srt = _build_srt_scaled(words, src_start, src_end, speed)
             if srt.strip():
@@ -156,14 +262,27 @@ def run(job, report) -> dict:
                 style = (f"FontName={_pick_font()},FontSize=20,PrimaryColour=&HFFFFFF,"
                          f"OutlineColour=&H90000000,BorderStyle=1,Outline=2,Shadow=0,"
                          f"Alignment=2,MarginV=60")
-                vf.append(f"subtitles='{_esc(str(srt_path))}':force_style='{style}'")
-        vf += _title_filters(pid, _titles_for_block(titles, edit_cursor))
+                cap_filters.append(f"subtitles='{_esc(str(srt_path))}':force_style='{style}'")
+        cap_filters += _title_filters(pid, _titles_for_block(titles, edit_cursor))
+
+        if kf:
+            # ---- Slice 11: keyframed transform path (captions/titles stay
+            # fixed on the canvas, applied after the overlay) ----
+            if src_wh is None:
+                src_wh = _source_wh(video)
+            vf_str = _keyframe_vf(kf, src_wh[0], src_wh[1], out_dur, speed)
+            if cap_filters:
+                vf_str += "," + ",".join(cap_filters)
+        else:
+            # ---- original path (unchanged) ----
+            vf = [f"setpts=PTS/{speed}"] + cap_filters
+            vf_str = ",".join(vf)
 
         af = [f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11"]
         out = project_dir(pid) / f"edl_seg_{n}.mp4"
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
                "-ss", str(src_start), "-to", str(src_end), "-i", str(video),
-               "-vf", ",".join(vf), "-c:v", "libx264", "-preset", "veryfast",
+               "-vf", vf_str, "-c:v", "libx264", "-preset", "veryfast",
                "-crf", "20"]
         if muted:
             cmd += ["-an"]

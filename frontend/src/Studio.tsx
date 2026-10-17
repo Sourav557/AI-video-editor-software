@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, fmtTC, fmtTime, JobStatus, Segment, Silence } from './api'
-import Timeline, { Block, blockDur, layoutBlocks, newId } from './Timeline'
+import Timeline, {
+  Block, blockDur, layoutBlocks, newId,
+  Kf, KfProp, Keyframes, KF_DEFAULTS, emptyKeyframes, kfVal, kfTransform,
+} from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
 import ClipsPanel from './ClipsPanel'
@@ -29,8 +32,110 @@ interface Edl {
 type View = 'source' | 'edit' | 'rendered'
 type Tab = 'clips' | 'transcript' | 'voice' | 'publish' | 'chat'
 
+const KF_ROWS: { key: KfProp; label: string; step: number; min: number; max: number }[] = [
+  { key: 'x', label: 'X (px)', step: 1, min: -4000, max: 4000 },
+  { key: 'y', label: 'Y (px)', step: 1, min: -4000, max: 4000 },
+  { key: 'scale', label: 'Scale', step: 0.05, min: 0.01, max: 8 },
+  { key: 'rot', label: 'Rotate (°)', step: 1, min: -360, max: 360 },
+  { key: 'op', label: 'Opacity', step: 0.05, min: 0, max: 1 },
+]
+
+/** Keyframe editor for the selected clip (Slice 11). Times are block-local
+ *  seconds (after speed is applied). */
+function KeyframesEditor({ block, localNow, dur, onChange, onCommit }: {
+  block: Block
+  localNow: number
+  dur: number
+  onChange: (kfs: Keyframes) => void
+  onCommit: () => void
+}) {
+  const kfs = block.keyframes ?? emptyKeyframes()
+  const setProp = (prop: KfProp, next: Kf[]) => {
+    const seen = new Map<number, number>()
+    for (const k of next) seen.set(Math.round(k.t * 100) / 100, k.v)
+    const clean = [...seen.entries()].map(([t, v]) => ({ t, v })).sort((a, b) => a.t - b.t)
+    onChange({ ...kfs, [prop]: clean })
+  }
+  const addAtPlayhead = (prop: KfProp) => {
+    const t = Math.round(Math.min(Math.max(localNow, 0), dur) * 100) / 100
+    const cur = [...(kfs[prop] ?? [])]
+    if (!cur.length) {
+      // seed the property default at t=0, plus the playhead keyframe
+      const seed: Kf[] = [{ t: 0, v: KF_DEFAULTS[prop] }]
+      if (t > 0.05) seed.push({ t, v: KF_DEFAULTS[prop] })
+      setProp(prop, seed)
+    } else {
+      setProp(prop, [...cur.filter((k) => Math.abs(k.t - t) > 0.02), { t, v: kfVal(kfs, prop, t) }])
+    }
+    onCommit()
+  }
+  const clampVal = (prop: KfProp, v: number) => {
+    const row = KF_ROWS.find((r) => r.key === prop)!
+    return Math.min(row.max, Math.max(row.min, v))
+  }
+  const num = (raw: string, fallback: number) => {
+    const v = parseFloat(raw)
+    return Number.isNaN(v) ? fallback : v
+  }
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+      <div className="font-semibold text-xs mb-1" style={{ color: 'var(--cyan)' }}>KEYFRAMES</div>
+      <div className="faint text-[10px] mb-2">Animate position, scale, rotation and opacity over the clip.</div>
+      {KF_ROWS.map((row) => {
+        const list = [...(kfs[row.key] ?? [])].sort((a, b) => a.t - b.t)
+        return (
+          <div key={row.key} className="mb-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold">{row.label}</span>
+              <div className="flex items-center gap-1.5">
+                {list.length > 0 && (
+                  <button className="text-[10px] faint hover:text-white" title="Clear all keyframes"
+                          onClick={() => { setProp(row.key, []); onCommit() }}>clear</button>
+                )}
+                <button className="text-[10px] px-1.5 py-0.5 rounded card"
+                        title="Add keyframe at playhead (block-local time)"
+                        onClick={() => addAtPlayhead(row.key)}>＋ at ▶</button>
+              </div>
+            </div>
+            {list.map((k, i) => (
+              <div key={i} className="flex items-center gap-1.5 mt-1 text-xs">
+                <span className="faint text-[10px]">t</span>
+                <input type="number" min={0} max={dur} step={0.1} value={k.t}
+                       className="w-16 px-1 py-0.5 rounded text-xs tabular"
+                       style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                       onChange={(e) => {
+                         const nt = [...list]
+                         nt[i] = { ...k, t: Math.min(Math.max(num(e.target.value, k.t), 0), dur) }
+                         setProp(row.key, nt)
+                       }}
+                       onBlur={onCommit} />
+                <span className="faint text-[10px]">s</span>
+                <input type="number" min={row.min} max={row.max} step={row.step}
+                       value={Math.round(k.v * 1000) / 1000}
+                       className="w-20 px-1 py-0.5 rounded text-xs tabular"
+                       style={{ background: 'var(--surface-2)', border: '1px solid var(--border)' }}
+                       onChange={(e) => {
+                         const nt = [...list]
+                         nt[i] = { ...k, v: clampVal(row.key, num(e.target.value, k.v)) }
+                         setProp(row.key, nt)
+                       }}
+                       onBlur={onCommit} />
+                <button className="faint hover:text-white text-xs" title="Delete keyframe"
+                        onClick={() => { setProp(row.key, list.filter((_, j) => j !== i)); onCommit() }}>✕</button>
+              </div>
+            ))}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function Studio({ projectId, fileName, segments, silences, language, srcDuration, onError, onImport }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const playerWrapRef = useRef<HTMLDivElement>(null)
+  const [vidAspect, setVidAspect] = useState('16 / 9')
   const saveTimer = useRef<number | null>(null)
   const loadedTl = useRef(false)
 
@@ -193,6 +298,54 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     if (v.paused) v.play(); else v.pause()
   }
 
+  // ---------- keyframe preview (Slice 11): draw the video onto a canvas,
+  // applying the JS-interpolated transform of the block under the playhead.
+  // Transport (play/pause/seek) still drives the underlying <video>. ------
+  // (kfLive wiring lives below, next to blockStarts)
+  useEffect(() => {
+    let raf = 0
+    const draw = () => {
+      raf = requestAnimationFrame(draw)
+      if (document.hidden) return
+      const v = videoRef.current, cv = canvasRef.current
+      if (!v || !cv || v.readyState < 2 || !v.videoWidth) return
+      const { blocks: blks, starts, view: vw } = kfLive.current
+      const cw = cv.clientWidth || v.videoWidth
+      const ch = Math.max(1, Math.round((cw * v.videoHeight) / v.videoWidth))
+      const dpr = Math.min(2, window.devicePixelRatio || 1)
+      if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)) {
+        cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr)
+      }
+      const ctx = cv.getContext('2d')
+      if (!ctx) return
+      // 'rendered' view already bakes the transforms in — don't double-apply
+      let tr = { x: 0, y: 0, scale: 1, rot: 0, op: 1 }
+      if (vw !== 'rendered') {
+        const ct = v.currentTime
+        for (let i = 0; i < blks.length; i++) {
+          const d = blockDur(blks[i])
+          if (ct >= starts[i] && ct < starts[i] + d) {
+            tr = kfTransform(blks[i].keyframes, ct - starts[i])
+            break
+          }
+        }
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, cw, ch)
+      ctx.save()
+      ctx.globalAlpha = Math.min(1, Math.max(0, tr.op))
+      ctx.translate(cw / 2 + tr.x, ch / 2 + tr.y)
+      ctx.rotate((tr.rot * Math.PI) / 180)
+      ctx.scale(Math.max(0.001, tr.scale), Math.max(0.001, tr.scale))
+      const vw2 = v.videoWidth, vh2 = v.videoHeight
+      const fit = Math.min(cw / vw2, ch / vh2)
+      ctx.drawImage(v, (-vw2 * fit) / 2, (-vh2 * fit) / 2, vw2 * fit, vh2 * fit)
+      ctx.restore()
+    }
+    raf = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
   // ---------- autopilot / render / seo ----------
   const runAutopilot = async () => {
     setApRunning(true); setApProgress(0); setShowAp(false)
@@ -258,11 +411,14 @@ export default function Studio({ projectId, fileName, segments, silences, langua
 
   const selected = blocks.find((b) => b.id === selectedId) ?? null
   const selectedTitle = titles.find((t) => t.id === selectedTitleId) ?? null
-  const { total: editTotal } = layoutBlocks(blocks)
-  const updateSelected = (patch: Partial<Block>) => {
+  const { starts: blockStarts, total: editTotal } = layoutBlocks(blocks)
+  const updateSelected = (patch: Partial<Block>, transient = false) => {
     if (!selected) return
-    commit(blocks.map((b) => (b.id === selected.id ? { ...b, ...patch } : b)))
+    commit(blocks.map((b) => (b.id === selected.id ? { ...b, ...patch } : b)), transient)
   }
+  // latest blocks/layout/view for the canvas preview loop (avoids effect churn)
+  const kfLive = useRef({ blocks, starts: blockStarts, view })
+  useEffect(() => { kfLive.current = { blocks, starts: blockStarts, view } }, [blocks, blockStarts, view])
   const posterUrl = filmstrip?.thumbs.length ? api.filmstripUrl(projectId, filmstrip.thumbs[0]) : null
 
   const tabs: { id: Tab; label: string }[] = [
@@ -347,9 +503,19 @@ export default function Studio({ projectId, fileName, segments, silences, langua
             <span className="font-semibold text-sm">Player</span>
             <span className="faint text-xs">Full Quality ▾</span>
           </div>
-          <video ref={videoRef} className="w-full rounded-lg max-h-[46vh]" style={{ background: '#000' }}
-                 onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
-                 onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} />
+          <div ref={playerWrapRef} className="relative rounded-lg overflow-hidden flex items-center justify-center"
+               style={{ background: '#000', maxHeight: '46vh' }}>
+            <video ref={videoRef} className="absolute inset-0 w-full h-full"
+                   style={{ opacity: 0, pointerEvents: 'none' }}
+                   onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+                   onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+                   onLoadedMetadata={() => {
+                     const v = videoRef.current
+                     if (v?.videoWidth) setVidAspect(`${v.videoWidth} / ${v.videoHeight}`)
+                   }} />
+            <canvas ref={canvasRef} className="block"
+                    style={{ aspectRatio: vidAspect, maxHeight: '46vh', maxWidth: '100%', background: '#000' }} />
+          </div>
           {/* transport */}
           <div className="mt-2">
             <input type="range" min={0} max={Math.max(editTotal, 0.01)} step={0.033}
@@ -366,7 +532,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                 <button title="Stop" onClick={() => { videoRef.current?.pause(); seek(0) }} className="px-2 py-1 card muted text-sm">⏹</button>
               </div>
               <div className="tabular text-xs faint">{fmtTC(currentTime)} <span className="mx-1">/</span> {fmtTC(editTotal || srcDuration)}</div>
-              <button title="Fullscreen" onClick={() => videoRef.current?.requestFullscreen?.()}
+              <button title="Fullscreen" onClick={() => playerWrapRef.current?.requestFullscreen?.()}
                       className="px-2 py-1 card muted text-sm">⛶</button>
             </div>
           </div>
@@ -411,6 +577,13 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                              onChange={(e) => updateSelected({ muted: e.target.checked })} />
                       Mute this clip
                     </label>
+                    <KeyframesEditor
+                      block={selected}
+                      localNow={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}
+                      dur={blockDur(selected)}
+                      onChange={(kfs) => updateSelected({ keyframes: kfs }, true)}
+                      onCommit={() => commit(blocks)}
+                    />
                   </>
                 )}
                 {selectedTitle && (

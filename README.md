@@ -49,7 +49,11 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 - [x] Slice 4 — Qwen3-TTS voiceover (preset voices + consent-gated voice cloning)
 - [x] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnail text)
 - [x] Slice 6 — co-editor agent (chat → plans → calls workers; montage stitching)
-- [ ] Slice 7 — desktop .exe (Tauri + NSIS installer, PyInstaller backend, CI-built)
+- [x] Slice 7 — desktop .exe (Tauri + NSIS installer, PyInstaller backend, CI-built)
+- [x] Slice 8 — Studio (Filmora-style layout, timeline, autopilot long-video self-edit)
+- [x] Slice 9 — full studio (razor/trim/reorder, undo/redo, clip properties, render_edl)
+- [x] Slice 10 — Filmora parity (filmstrip, menu bar, media bin, titles track, transport, timeline persist)
+- [x] Slice 11 — keyframed transforms (position/scale/rotation/opacity) + keyframe UI
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)
 - [ ] Slice 6 — editing agent + style profiles

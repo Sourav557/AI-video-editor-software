@@ -8,6 +8,53 @@ export interface Block {
   srcEnd: number
   speed: number
   muted: boolean
+  keyframes?: Keyframes
+}
+
+/** One keyframe: t = seconds relative to the block's output-time start
+ *  (after speed is applied), v = property value at that time. */
+export interface Kf { t: number; v: number }
+
+export type KfProp = 'x' | 'y' | 'scale' | 'rot' | 'op'
+
+/** Keyframed transforms. Defaults: x=0, y=0 (px offset of clip's top-left
+ *  on the centered canvas), scale=1, rot=0 (degrees), op=1. */
+export type Keyframes = Record<KfProp, Kf[]>
+
+export const KF_DEFAULTS: Record<KfProp, number> = { x: 0, y: 0, scale: 1, rot: 0, op: 1 }
+
+export const emptyKeyframes = (): Keyframes => ({ x: [], y: [], scale: [], rot: [], op: [] })
+
+/** Linear interpolation between keyframes; before first = first value,
+ *  after last = last value. No keyframes -> the property default. */
+export function kfVal(kfs: Keyframes | undefined, prop: KfProp, t: number): number {
+  const ks = [...(kfs?.[prop] ?? [])].sort((a, b) => a.t - b.t)
+  if (!ks.length) return KF_DEFAULTS[prop]
+  if (t <= ks[0].t) return ks[0].v
+  for (let i = 0; i < ks.length - 1; i++) {
+    const a = ks[i], b = ks[i + 1]
+    if (t <= b.t) {
+      const span = b.t - a.t
+      return span < 1e-9 ? b.v : a.v + ((b.v - a.v) * (t - a.t)) / span
+    }
+  }
+  return ks[ks.length - 1].v
+}
+
+/** Interpolated transform for a block at block-local time t. */
+export function kfTransform(kfs: Keyframes | undefined, t: number) {
+  return {
+    x: kfVal(kfs, 'x', t),
+    y: kfVal(kfs, 'y', t),
+    scale: kfVal(kfs, 'scale', t),
+    rot: kfVal(kfs, 'rot', t),
+    op: kfVal(kfs, 'op', t),
+  }
+}
+
+export function blockHasKeyframes(b: Block): boolean {
+  const k = b.keyframes
+  return !!k && (k.x.length + k.y.length + k.scale.length + k.rot.length + k.op.length) > 0
 }
 
 export const blockDur = (b: Block) => Math.max(0.01, (b.srcEnd - b.srcStart) / b.speed)
@@ -317,7 +364,7 @@ export default function Timeline(p: Props) {
                     {blockDur(b) * p.pxPerSec > 60 && (
                       <div className="absolute bottom-0 left-0 right-0 text-[9px] px-2 py-0.5 truncate z-10"
                            style={{ background: 'rgba(0,0,0,.55)' }}>
-                        {b.speed !== 1 ? `${b.speed}x · ` : ''}{fmtTime(b.srcStart)}→{fmtTime(b.srcEnd)}
+                        {blockHasKeyframes(b) ? '◆ ' : ''}{b.speed !== 1 ? `${b.speed}x · ` : ''}{fmtTime(b.srcStart)}→{fmtTime(b.srcEnd)}
                       </div>
                     )}
                   </div>
