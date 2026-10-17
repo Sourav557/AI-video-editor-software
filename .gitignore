@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+backend/data/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Models (large, re-downloadable)
+*.pt
+*.bin
+*.onnx
+*.gguf
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets — NEVER commit tokens or keys
+.env
+*.pem
+/tmp/

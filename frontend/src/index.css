@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+/* LocalCut design tokens — dark-first, premium creative-tool feel */
+:root {
+  --bg: #0b0d12;
+  --surface: #12151c;
+  --surface-2: #181c25;
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #f2f4f8;
+  --text-2: #9aa3b2;
+  --text-3: #6b7383;
+  --accent: #7c5cff;
+  --accent-hover: #8f74ff;
+  --cyan: #22d3ee;
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --ai-gradient: linear-gradient(135deg, #7c5cff, #22d3ee);
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, "Inter", sans-serif;
+  min-height: 100%;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-radius: 8px;
+  font-weight: 600;
+  transition: background 160ms ease-out;
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.ai-glow {
+  background: var(--ai-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.tabular { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+.muted { color: var(--text-2); }
+.faint { color: var(--text-3); }
