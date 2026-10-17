@@ -92,6 +92,14 @@ export const api = {
   autopilotGet: (pid: string) => req<any>(`/api/projects/${pid}/autopilot`),
   sourceUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/source/file`,
   autopilotUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/autopilot/file`,
+  editFileUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/edit/file`,
+  editRender: (pid: string, blocks: any[], captions: boolean) =>
+    req<{ render_job: string }>(`/api/projects/${pid}/edit/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocks, captions }),
+    }),
+  editGet: (pid: string) => req<any>(`/api/projects/${pid}/edit`),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

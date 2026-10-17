@@ -13,6 +13,7 @@ export default function App() {
   const [segments, setSegments] = useState<Segment[]>([])
   const [silences, setSilences] = useState<Silence[]>([])
   const [language, setLanguage] = useState('')
+  const [srcDuration, setSrcDuration] = useState(0)
   const [error, setError] = useState('')
   const pollRef = useRef<number | null>(null)
 
@@ -65,6 +66,10 @@ export default function App() {
         setSegments(t.transcript?.segments ?? [])
         setSilences(t.silence?.silences ?? [])
         setLanguage(t.transcript?.language ?? '')
+        try {
+          const w = await api.waveform(projectId)
+          setSrcDuration(w.duration ?? 0)
+        } catch {}
         setPhase('analyzed')
       })
     } catch (e: any) { setError(e.message); setPhase('error') }
@@ -88,7 +93,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 8: Studio</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 9: Full studio</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -156,6 +161,7 @@ export default function App() {
         {analyzed && projectId && (
           <Studio projectId={projectId} fileName={fileName}
                   segments={segments} silences={silences} language={language}
+                  srcDuration={srcDuration}
                   onError={(m) => setError(m)} />
         )}
         {error && analyzed && (
@@ -164,7 +170,7 @@ export default function App() {
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 8 of the roadmap — the studio. Nothing leaves your machine.
+          Slice 9 of the roadmap — the full studio. Nothing leaves your machine.
         </footer>
       </main>
     </div>

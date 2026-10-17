@@ -347,3 +347,40 @@ def autopilot_file(pid: str):
     if not path.exists():
         raise HTTPException(404, "autopilot output not ready yet")
     return FileResponse(path, media_type="video/mp4", filename="autopilot.mp4")
+
+
+# ---- Slice 9: full studio — render the user's timeline edit ----
+
+@router.post("/projects/{pid}/edit/render")
+def edit_render(pid: str, body: dict):
+    """Render an explicit block list from the timeline editor."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    blocks = body.get("blocks") or []
+    if not blocks:
+        raise HTTPException(400, "empty timeline")
+    job = orchestrator.submit("render_edl", pid, priority=15, params={
+        "blocks": blocks,
+        "captions": body.get("captions", True),
+    })
+    return {"render_job": job.id}
+
+
+@router.get("/projects/{pid}/edit")
+def edit_get(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    edl = load_json(pid, "edit_edl.json")
+    if edl is None:
+        raise HTTPException(404, "no manual edit yet")
+    return edl
+
+
+@router.get("/projects/{pid}/edit/file")
+def edit_file(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    path = project_dir(pid) / "edit.mp4"
+    if not path.exists():
+        raise HTTPException(404, "edit output not ready yet")
+    return FileResponse(path, media_type="video/mp4", filename="edit.mp4")
