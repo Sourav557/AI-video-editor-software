@@ -50,7 +50,9 @@ def analyze(pid: str):
     t = orchestrator.submit("transcribe", pid, priority=10)
     s = orchestrator.submit("silence", pid, priority=10)
     w = orchestrator.submit("waveform", pid, priority=5, depends_on=[t.id])
-    return {"transcribe_job": t.id, "silence_job": s.id, "waveform_job": w.id}
+    f = orchestrator.submit("filmstrip", pid, priority=5)
+    return {"transcribe_job": t.id, "silence_job": s.id, "waveform_job": w.id,
+            "filmstrip_job": f.id}
 
 
 @router.get("/jobs/{job_id}")
@@ -362,6 +364,7 @@ def edit_render(pid: str, body: dict):
     job = orchestrator.submit("render_edl", pid, priority=15, params={
         "blocks": blocks,
         "captions": body.get("captions", True),
+        "titles": body.get("titles") or [],
     })
     return {"render_job": job.id}
 
@@ -384,3 +387,105 @@ def edit_file(pid: str):
     if not path.exists():
         raise HTTPException(404, "edit output not ready yet")
     return FileResponse(path, media_type="video/mp4", filename="edit.mp4")
+
+
+# ---- Slice 10: Filmora parity — filmstrip, project info, timeline persist ----
+
+@router.get("/projects/{pid}/filmstrip")
+def filmstrip_get(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    fs = load_json(pid, "filmstrip.json")
+    if fs is None:
+        raise HTTPException(404, "no filmstrip yet — run Analyze first")
+    return fs
+
+
+@router.get("/projects/{pid}/filmstrip/{name}")
+def filmstrip_thumb(pid: str, name: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not name.startswith("thumb_") or not name.endswith(".jpg") \
+            or "/" in name or "\\" in name:
+        raise HTTPException(400, "invalid thumbnail name")
+    path = project_dir(pid) / "filmstrip" / name
+    if not path.exists():
+        raise HTTPException(404, "thumbnail not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@router.get("/projects/{pid}/info")
+def project_info(pid: str):
+    """Resolution, fps, duration… — the Project Info panel."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    video = get_video_path(pid)
+    if video is None:
+        raise HTTPException(404, "no video uploaded")
+    import json as _json
+    import shutil as _shutil
+    import subprocess as _sp
+    ffprobe = _shutil.which("ffprobe")
+    if not ffprobe:
+        raise HTTPException(500, "ffprobe not found")
+    p = _sp.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,r_frame_rate,duration,pix_fmt",
+                 "-show_entries", "format=duration,size",
+                 "-of", "json", str(video)],
+                capture_output=True, text=True)
+    info = _json.loads(p.stdout or "{}")
+    st = (info.get("streams") or [{}])[0]
+    fmt = info.get("format") or {}
+    fps = st.get("r_frame_rate", "0/1")
+    try:
+        num, den = fps.split("/")
+        fps_f = round(int(num) / int(den), 2) if int(den) else 0
+    except Exception:
+        fps_f = 0
+    size_mb = round(int(fmt.get("size", 0)) / 1e6, 1)
+    return {"filename": video.name, "width": st.get("width"),
+            "height": st.get("height"), "fps": fps_f,
+            "duration": round(float(fmt.get("duration") or st.get("duration") or 0), 1),
+            "pix_fmt": st.get("pix_fmt"), "size_mb": size_mb}
+
+
+@router.get("/projects/{pid}/audio")
+def audio_list(pid: str):
+    """Voiceover WAVs for the Audio tab."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    files = sorted(project_dir(pid).glob("tts_*.wav"), key=lambda p: p.name)
+    return {"files": [f.name for f in files]}
+
+
+@router.get("/projects/{pid}/audio/{name}")
+def audio_file(pid: str, name: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if not name.startswith("tts_") or not name.endswith(".wav") \
+            or "/" in name or "\\" in name:
+        raise HTTPException(400, "invalid audio name")
+    path = project_dir(pid) / name
+    if not path.exists():
+        raise HTTPException(404, "audio not found")
+    return FileResponse(path, media_type="audio/wav", filename=name)
+
+
+@router.get("/projects/{pid}/timeline")
+def timeline_get(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    tl = load_json(pid, "timeline.json")
+    if tl is None:
+        raise HTTPException(404, "no saved timeline")
+    return tl
+
+
+@router.post("/projects/{pid}/timeline")
+def timeline_save(pid: str, body: dict):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    save_json(pid, "timeline.json",
+              {"blocks": body.get("blocks") or [],
+               "titles": body.get("titles") or []})
+    return {"ok": True}

@@ -53,11 +53,75 @@ def _atempo(speed: float) -> str:
     return ",".join(parts)
 
 
+def _font_file() -> str | None:
+    """Resolve a bold TTF with Latin coverage for drawtext (cross-platform)."""
+    import os
+    fc = shutil.which("fc-list")
+    if fc:
+        # try known Latin families first — a bare ":style=Bold" query can
+        # return a CJK/symbol font whose glyphs render as tofu boxes
+        for family in ("DejaVu Sans", "Liberation Sans", "Noto Sans", "Arial"):
+            try:
+                out = subprocess.run(
+                    [fc, "--format=%{file}\n", f"{family}:style=Bold"],
+                    capture_output=True, text=True, timeout=15).stdout
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.lower().endswith((".ttf", ".otf")):
+                        return line
+            except Exception:
+                pass
+    cands = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    return next((c for c in cands if os.path.exists(c)), None)
+
+
+def _titles_for_block(titles: list[dict], edit_cursor: float) -> list[dict]:
+    """Titles overlapping this block, shifted into the block's local time."""
+    out = []
+    for tl in titles:
+        s = float(tl.get("start", 0)) - edit_cursor
+        e = float(tl.get("end", 0)) - edit_cursor
+        if e > 0 and s < 1e9:
+            out.append({**tl, "start": max(0.0, s), "end": max(0.0, e)})
+    return out
+
+
+def _title_filters(pid: str, titles: list[dict]) -> list[str]:
+    """drawtext filters for title overlays (edit timebase)."""
+    font = _font_file()
+    if not font or not titles:
+        return []
+    filters = []
+    d = project_dir(pid)
+    for n, tl in enumerate(titles):
+        text = (tl.get("text") or "").strip()
+        if not text:
+            continue
+        start, end = float(tl.get("start", 0)), float(tl.get("end", 3))
+        if end <= start:
+            continue
+        tf = d / f"title_{n}.txt"
+        tf.write_text(text)
+        size = int(tl.get("size", 48))
+        y = "120" if tl.get("position", "bottom") == "top" else "(h-text_h-120)"
+        filters.append(
+            f"drawtext=fontfile='{_esc(font)}':textfile='{_esc(str(tf))}'"
+            f":fontsize={size}:fontcolor=white"
+            f":borderw=2:bordercolor=black@0.8"
+            f":x=(w-text_w)/2:y={y}"
+            f":enable='between(t,{start:.2f},{end:.2f})'")
+    return filters
+
+
 def run(job, report) -> dict:
     params = job.params or {}
     pid = job.project_id
     blocks = params.get("blocks") or []
     captions = params.get("captions", True)
+    titles = params.get("titles") or []
     if not blocks:
         raise RuntimeError("empty timeline — nothing to render")
 
@@ -73,6 +137,7 @@ def run(job, report) -> dict:
 
     seg_files = []
     total = len(blocks)
+    edit_cursor = 0.0  # position in the final (edit timebase) video
     for n, b in enumerate(blocks):
         src_start = float(b["srcStart"])
         src_end = float(b["srcEnd"])
@@ -92,6 +157,7 @@ def run(job, report) -> dict:
                          f"OutlineColour=&H90000000,BorderStyle=1,Outline=2,Shadow=0,"
                          f"Alignment=2,MarginV=60")
                 vf.append(f"subtitles='{_esc(str(srt_path))}':force_style='{style}'")
+        vf += _title_filters(pid, _titles_for_block(titles, edit_cursor))
 
         af = [f"{_atempo(speed)},loudnorm=I=-14:TP=-1.0:LRA=11"]
         out = project_dir(pid) / f"edl_seg_{n}.mp4"
@@ -106,6 +172,7 @@ def run(job, report) -> dict:
         cmd.append(str(out))
         subprocess.run(cmd, check=True)
         seg_files.append(str(out))
+        edit_cursor += (src_end - src_start) / speed
         report(0.1 + 0.8 * (n + 1) / total)
 
     if not seg_files:
@@ -131,8 +198,8 @@ def run(job, report) -> dict:
     out_dur = round(float(pr.stdout.strip()), 1)
 
     edl = {"blocks": blocks, "output_duration": out_dur,
-           "captions": captions}
+           "captions": captions, "titles": titles}
     save_json(pid, "edit_edl.json", edl)
     report(1.0)
     return {"file": out.name, "blocks": len(blocks),
-            "output_duration": out_dur}
+            "output_duration": out_dur, "titles": len(titles)}

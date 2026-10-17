@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fmtTime } from './api'
+import type { TitleT } from './MediaBin'
 
 export interface Block {
   id: string
@@ -43,6 +44,12 @@ interface Props {
   commit: (next: Block[], transient?: boolean) => void
   peaks: number[]
   srcDuration: number
+  filmstrip: { interval: number; thumbs: string[] } | null
+  filmstripUrl: (name: string) => string
+  titles: TitleT[]
+  onTitlesCommit: (next: TitleT[], transient?: boolean) => void
+  selectedTitleId: string | null
+  onSelectTitle: (id: string | null) => void
   currentTime: number
   onSeek: (t: number) => void
   selectedId: string | null
@@ -60,6 +67,9 @@ export default function Timeline(p: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [drag, setDrag] = useState<null | {
     id: string; mode: 'move' | 'trim-l' | 'trim-r'; startX: number; orig: Block; over: number
+  }>(null)
+  const [tdrag, setTdrag] = useState<null | {
+    id: string; mode: 'move' | 'trim-l' | 'trim-r'; startX: number; orig: TitleT
   }>(null)
 
   const { starts, total } = useMemo(() => layoutBlocks(p.blocks), [p.blocks])
@@ -93,39 +103,59 @@ export default function Timeline(p: Props) {
 
   const editX = (t: number) => (t / Math.max(total, 0.01)) * width
 
+  /** Filmstrip thumbnails across a video block (Filmora look). */
+  const thumbStrip = (b: Block, i: number) => {
+    if (!p.filmstrip || !p.filmstrip.thumbs.length) return null
+    const wPx = blockDur(b) * p.pxPerSec
+    if (wPx < 50) return null
+    const n = Math.ceil(wPx / 90)
+    const imgs = []
+    for (let k = 0; k < n; k++) {
+      const editT = starts[i] + ((k + 0.5) * 90) / p.pxPerSec
+      const srcT = b.srcStart + (editT - starts[i]) * b.speed
+      const idx = Math.min(
+        p.filmstrip.thumbs.length - 1,
+        Math.max(0, Math.floor(srcT / p.filmstrip.interval)),
+      )
+      imgs.push(
+        <img key={k} src={p.filmstripUrl(p.filmstrip.thumbs[idx])}
+             draggable={false} alt=""
+             style={{ width: 90, height: '100%', objectFit: 'cover', flexShrink: 0 }} />,
+      )
+    }
+    return <div className="absolute inset-0 flex overflow-hidden opacity-70 pointer-events-none">{imgs}</div>
+  }
+
   const onBlockDown = (e: React.PointerEvent, b: Block, idx: number) => {
     if (p.trackLocked) return
     e.stopPropagation()
-    const x = e.clientX
+    p.onSelect(b.id); p.onSelectTitle(null)
     if (p.tool === 'razor') {
-      // split at click position (edit timebase)
       const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
       const clickEdit = starts[idx] + (e.clientX - rect.left) / p.pxPerSec
-      const offsetSrc = (clickEdit - starts[idx]) * b.speed
-      const cutSrc = b.srcStart + offsetSrc
+      const cutSrc = b.srcStart + (clickEdit - starts[idx]) * b.speed
       if (cutSrc - b.srcStart < 0.15 || b.srcEnd - cutSrc < 0.15) return
-      const left: Block = { ...b }
+      const left: Block = { ...b, srcEnd: cutSrc }
       const right: Block = { ...b, id: newId(), srcStart: cutSrc }
-      left.srcEnd = cutSrc
       const next = [...p.blocks]
       next.splice(idx, 1, left, right)
       p.commit(next)
       p.onSelect(right.id)
       return
     }
-    p.onSelect(b.id)
     const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
     const edge = e.clientX - rect.left < 8 ? 'trim-l'
       : rect.right - e.clientX < 8 ? 'trim-r' : 'move'
     ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
-    setDrag({ id: b.id, mode: edge, startX: x, orig: { ...b }, over: idx })
+    setDrag({ id: b.id, mode: edge, startX: e.clientX, orig: { ...b }, over: idx })
   }
 
   const onBlockMove = (e: React.PointerEvent) => {
     if (!drag) return
     const dxEdit = (e.clientX - drag.startX) / p.pxPerSec
     if (drag.mode === 'move') {
-      const targetCenter = starts[p.blocks.findIndex((b) => b.id === drag.id)] + dxEdit + blockDur(drag.orig) / 2
+      const fromIdx = p.blocks.findIndex((bb) => bb.id === drag.id)
+      const targetCenter = starts[fromIdx] + dxEdit + blockDur(drag.orig) / 2
       let over = p.blocks.length - 1
       for (let i = 0; i < p.blocks.length; i++) {
         if (targetCenter < starts[i] + blockDur(p.blocks[i])) { over = i; break }
@@ -133,31 +163,66 @@ export default function Timeline(p: Props) {
       setDrag({ ...drag, over })
     } else {
       const dSrc = dxEdit * drag.orig.speed
-      const next = p.blocks.map((b) => {
-        if (b.id !== drag.id) return b
-        const nb = { ...b }
+      const next = p.blocks.map((bb) => {
+        if (bb.id !== drag.id) return bb
+        const nb = { ...bb }
         if (drag.mode === 'trim-l') nb.srcStart = Math.min(drag.orig.srcStart + dSrc, drag.orig.srcEnd - 0.1)
         else nb.srcEnd = Math.max(drag.orig.srcEnd + dSrc, drag.orig.srcStart + 0.1)
         nb.srcStart = Math.max(0, nb.srcStart)
         return nb
       })
-      p.commit(next, true) // transient: single history entry on release
+      p.commit(next, true)
     }
   }
 
   const onBlockUp = () => {
     if (drag?.mode === 'move') {
-      const from = p.blocks.findIndex((b) => b.id === drag.id)
+      const from = p.blocks.findIndex((bb) => bb.id === drag.id)
       if (from !== -1 && drag.over !== from) {
         const next = [...p.blocks]
-        const [b] = next.splice(from, 1)
-        next.splice(drag.over, 0, b)
+        const [bb] = next.splice(from, 1)
+        next.splice(drag.over, 0, bb)
         p.commit(next)
       }
-    } else if (drag && (drag.mode === 'trim-l' || drag.mode === 'trim-r')) {
-      p.commit(p.blocks) // finalize the trim as one undo step
+    } else if (drag) {
+      p.commit(p.blocks)
     }
     setDrag(null)
+  }
+
+  // ---- title chips ----
+  const onTitleDown = (e: React.PointerEvent, t: TitleT) => {
+    if (p.trackLocked) return
+    e.stopPropagation()
+    p.onSelectTitle(t.id); p.onSelect(null)
+    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
+    const edge = e.clientX - rect.left < 8 ? 'trim-l'
+      : rect.right - e.clientX < 8 ? 'trim-r' : 'move'
+    ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+    setTdrag({ id: t.id, mode: edge, startX: e.clientX, orig: { ...t } })
+  }
+  const onTitleMove = (e: React.PointerEvent) => {
+    if (!tdrag) return
+    const dx = (e.clientX - tdrag.startX) / p.pxPerSec
+    const next = p.titles.map((t) => {
+      if (t.id !== tdrag.id) return t
+      const nt = { ...t }
+      if (tdrag.mode === 'move') {
+        const len = tdrag.orig.end - tdrag.orig.start
+        nt.start = Math.max(0, tdrag.orig.start + dx)
+        nt.end = nt.start + len
+      } else if (tdrag.mode === 'trim-l') {
+        nt.start = Math.min(tdrag.orig.start + dx, tdrag.orig.end - 0.3)
+      } else {
+        nt.end = Math.max(tdrag.orig.end + dx, tdrag.orig.start + 0.3)
+      }
+      return nt
+    })
+    p.onTitlesCommit(next, true)
+  }
+  const onTitleUp = () => {
+    if (tdrag) p.onTitlesCommit(p.titles)
+    setTdrag(null)
   }
 
   const seekFromEvent = (e: React.MouseEvent) => {
@@ -169,23 +234,13 @@ export default function Timeline(p: Props) {
 
   return (
     <div className="card overflow-hidden select-none">
-      <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--border)' }}>
-        <div className="flex items-center gap-3 text-xs">
-          <span className="font-semibold">Timeline</span>
-          <span className="faint tabular">{fmtTime(p.currentTime)} / {fmtTime(total)}</span>
-          <span className="faint">{p.blocks.length} clips</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs muted">
-          <span>Zoom</span>
-          <input type="range" min={8} max={160} value={p.pxPerSec}
-                 onChange={(e) => p.setPxPerSec(Number(e.target.value))} className="w-28" />
-        </div>
-      </div>
-
       <div className="flex">
         {/* track headers */}
         <div className="shrink-0 w-20 border-r" style={{ borderColor: 'var(--border)', background: 'var(--surface-2)' }}>
           <div className="h-6 border-b" style={{ borderColor: 'var(--border)' }} />
+          <div className="h-9 border-b flex items-center justify-center gap-2" style={{ borderColor: 'var(--border)' }}>
+            <span className="text-[10px] font-bold faint">T2</span>
+          </div>
           <div className="h-16 border-b flex flex-col items-center justify-center gap-1" style={{ borderColor: 'var(--border)' }}>
             <span className="text-[10px] font-bold faint">V1</span>
             <button title={p.trackLocked ? 'Unlock track' : 'Lock track'}
@@ -211,6 +266,31 @@ export default function Timeline(p: Props) {
               ))}
             </div>
 
+            {/* T2 titles track */}
+            <div className="relative h-9 border-b" style={{ borderColor: 'var(--border)', background: '#0d1017' }}
+                 onClick={seekFromEvent} onPointerMove={onTitleMove} onPointerUp={onTitleUp} onPointerLeave={onTitleUp}>
+              {p.titles.map((t) => (
+                <div key={t.id}
+                     onPointerDown={(e) => onTitleDown(e, t)}
+                     className="absolute inset-y-1 rounded flex items-center px-2 gap-1 overflow-hidden"
+                     style={{
+                       left: t.start * p.pxPerSec,
+                       width: Math.max(10, (t.end - t.start) * p.pxPerSec),
+                       background: 'linear-gradient(180deg, rgba(34,211,238,.5), rgba(34,211,238,.25))',
+                       border: t.id === p.selectedTitleId ? '2px solid var(--cyan)' : '1px solid rgba(34,211,238,.6)',
+                       cursor: 'grab',
+                     }}>
+                  <div className="absolute inset-y-0 left-0 w-1.5 cursor-ew-resize" style={{ background: 'rgba(255,255,255,.3)' }} />
+                  <div className="absolute inset-y-0 right-0 w-1.5 cursor-ew-resize" style={{ background: 'rgba(255,255,255,.3)' }} />
+                  <span className="font-bold text-[10px] ai-glow shrink-0">T</span>
+                  {(t.end - t.start) * p.pxPerSec > 50 && (
+                    <span className="text-[10px] truncate">{t.text}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* V1 */}
             <div className="relative h-16 border-b" style={{ borderColor: 'var(--border)', background: '#0b0e14', cursor: p.tool === 'razor' ? 'crosshair' : 'default' }}
                  onClick={seekFromEvent}
                  onPointerMove={onBlockMove} onPointerUp={onBlockUp} onPointerLeave={onBlockUp}>
@@ -224,19 +304,19 @@ export default function Timeline(p: Props) {
                        style={{
                          left: starts[i] * p.pxPerSec,
                          width: Math.max(4, blockDur(b) * p.pxPerSec),
-                         background: sel
-                           ? 'linear-gradient(180deg, rgba(34,211,238,.75), rgba(124,58,237,.6))'
-                           : 'linear-gradient(180deg, rgba(124,58,237,.55), rgba(34,211,238,.35))',
+                         background: 'rgba(30,27,75,.85)',
                          border: sel ? '2px solid var(--cyan)' : '1px solid rgba(139,92,246,.6)',
                          cursor: p.tool === 'razor' ? 'crosshair' : 'grab',
                          opacity: b.muted ? 0.55 : 1,
                        }}>
-                    <div className="absolute inset-y-0 left-0 w-2 cursor-ew-resize"
+                    {thumbStrip(b, i)}
+                    <div className="absolute inset-y-0 left-0 w-2 cursor-ew-resize z-10"
                          style={{ background: 'rgba(255,255,255,.25)' }} />
-                    <div className="absolute inset-y-0 right-0 w-2 cursor-ew-resize"
+                    <div className="absolute inset-y-0 right-0 w-2 cursor-ew-resize z-10"
                          style={{ background: 'rgba(255,255,255,.25)' }} />
                     {blockDur(b) * p.pxPerSec > 60 && (
-                      <div className="text-[9px] px-2 py-0.5 truncate faint">
+                      <div className="absolute bottom-0 left-0 right-0 text-[9px] px-2 py-0.5 truncate z-10"
+                           style={{ background: 'rgba(0,0,0,.55)' }}>
                         {b.speed !== 1 ? `${b.speed}x · ` : ''}{fmtTime(b.srcStart)}→{fmtTime(b.srcEnd)}
                       </div>
                     )}
@@ -244,16 +324,18 @@ export default function Timeline(p: Props) {
                 )
               })}
               {drag?.mode === 'move' && (
-                <div className="absolute top-0 bottom-0 w-0.5 pointer-events-none"
+                <div className="absolute top-0 bottom-0 w-0.5 pointer-events-none z-20"
                      style={{ left: starts[Math.min(drag.over, starts.length - 1)] * p.pxPerSec, background: 'var(--warning)' }} />
               )}
             </div>
 
+            {/* A1 */}
             <div className="relative h-16" style={{ background: '#0b0e14', cursor: 'pointer' }} onClick={seekFromEvent}>
               <canvas ref={canvasRef} style={{ width, height: 64 }} className="absolute inset-0" />
             </div>
 
-            <div className="absolute top-0 bottom-0 pointer-events-none" style={{ left: playX }}>
+            {/* playhead */}
+            <div className="absolute top-0 bottom-0 pointer-events-none z-30" style={{ left: playX }}>
               <div className="w-px h-full" style={{ background: 'var(--danger)' }} />
               <div className="w-3 h-3 rotate-45 -ml-1.5 -mt-0.5" style={{ background: 'var(--danger)' }} />
             </div>

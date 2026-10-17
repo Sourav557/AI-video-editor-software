@@ -6,6 +6,17 @@
 const API_BASE: string =
   ((import.meta as any).env?.VITE_API_BASE as string | undefined) ?? '';
 
+/** Timecode HH:MM:SS:FF (Filmora-style, 30fps). */
+export function fmtTC(sec: number, fps = 30): string {
+  const s = Math.max(0, sec)
+  const f = Math.floor((s % 1) * fps)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const ss = Math.floor(s % 60)
+  const p = (n: number, l = 2) => String(n).padStart(l, '0')
+  return `${p(h)}:${p(m)}:${p(ss)}:${p(f)}`
+}
+
 export interface JobStatus {
   id: string
   kind: string
@@ -36,7 +47,7 @@ export const api = {
     })
   },
   analyze: (pid: string) =>
-    req<{ transcribe_job: string; silence_job: string; waveform_job: string }>(
+    req<{ transcribe_job: string; silence_job: string; waveform_job: string; filmstrip_job: string }>(
       `/api/projects/${pid}/analyze`,
       { method: 'POST' },
     ),
@@ -93,13 +104,25 @@ export const api = {
   sourceUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/source/file`,
   autopilotUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/autopilot/file`,
   editFileUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/edit/file`,
-  editRender: (pid: string, blocks: any[], captions: boolean) =>
+  editRender: (pid: string, blocks: any[], captions: boolean, titles: any[]) =>
     req<{ render_job: string }>(`/api/projects/${pid}/edit/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ blocks, captions }),
+      body: JSON.stringify({ blocks, captions, titles }),
     }),
   editGet: (pid: string) => req<any>(`/api/projects/${pid}/edit`),
+  filmstrip: (pid: string) => req<{ interval: number; thumbs: string[]; width: number; height: number }>(`/api/projects/${pid}/filmstrip`),
+  filmstripUrl: (pid: string, name: string) => `${API_BASE}/api/projects/${pid}/filmstrip/${name}`,
+  projectInfo: (pid: string) => req<any>(`/api/projects/${pid}/info`),
+  audioList: (pid: string) => req<{ files: string[] }>(`/api/projects/${pid}/audio`),
+  audioUrl: (pid: string, name: string) => `${API_BASE}/api/projects/${pid}/audio/${name}`,
+  timelineGet: (pid: string) => req<{ blocks: any[]; titles: any[] }>(`/api/projects/${pid}/timeline`),
+  timelineSave: (pid: string, blocks: any[], titles: any[]) =>
+    req<{ ok: boolean }>(`/api/projects/${pid}/timeline`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocks, titles }),
+    }),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

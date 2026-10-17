@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, JobStatus, Segment, Silence } from './api'
+import MenuBar from './MenuBar'
 import Studio from './Studio'
 
 type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'analyzed' | 'error'
@@ -60,8 +61,8 @@ export default function App() {
     if (!projectId) return
     setError(''); setPhase('analyzing')
     try {
-      const { transcribe_job, silence_job, waveform_job } = await api.analyze(projectId)
-      pollUntilDone([transcribe_job, silence_job, waveform_job], async () => {
+      const { transcribe_job, silence_job, waveform_job, filmstrip_job } = await api.analyze(projectId)
+      pollUntilDone([transcribe_job, silence_job, waveform_job, filmstrip_job], async () => {
         const t = await api.transcript(projectId)
         setSegments(t.transcript?.segments ?? [])
         setSilences(t.silence?.silences ?? [])
@@ -82,18 +83,32 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
+      <MenuBar menus={[
+        { label: 'File', items: [
+          { label: 'Import media…', action: () => document.getElementById('file-input')?.click() },
+          { label: 'New project', hint: 'Ctrl+N', action: () => window.location.reload() },
+        ]},
+        { label: 'Edit', items: [
+          { label: 'Undo', hint: 'Ctrl+Z', action: () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true })) },
+          { label: 'Redo', hint: 'Ctrl+Y', action: () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'y', ctrlKey: true })) },
+          { label: 'Delete selected', hint: 'Del', action: () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete' })) },
+        ]},
+        { label: 'View', items: [
+          { label: 'Reload', hint: 'Ctrl+R', action: () => window.location.reload() },
+        ]},
+        { label: 'Help', items: [
+          { label: 'About LocalCut', action: () => alert('LocalCut — free, fully local AI video editor.\nNothing leaves your machine.') },
+        ]},
+      ]} />
       <header className="border-b" style={{ borderColor: 'var(--border)' }}>
-        <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-[1400px] mx-auto px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl flex items-center justify-center font-bold text-lg"
-                 style={{ background: 'var(--ai-gradient)' }}>L</div>
             <div>
-              <div className="font-bold text-lg leading-tight">LocalCut</div>
-              <div className="faint text-xs">Free · Local · AI Video Editor</div>
+              <div className="font-bold text-lg leading-tight">LocalCut <span className="faint font-normal text-sm">Studio</span></div>
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 9: Full studio</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 10: Filmora parity</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -162,7 +177,8 @@ export default function App() {
           <Studio projectId={projectId} fileName={fileName}
                   segments={segments} silences={silences} language={language}
                   srcDuration={srcDuration}
-                  onError={(m) => setError(m)} />
+                  onError={(m) => setError(m)}
+                  onImport={doUpload} />
         )}
         {error && analyzed && (
           <div className="text-sm px-4 py-3 rounded-lg"
@@ -170,7 +186,7 @@ export default function App() {
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 9 of the roadmap — the full studio. Nothing leaves your machine.
+          Slice 10 of the roadmap — Filmora parity. Nothing leaves your machine.
         </footer>
       </main>
     </div>
