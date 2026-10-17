@@ -10,7 +10,9 @@ Output: edit.mp4 + edit_edl.json. Idempotent.
 """
 from __future__ import annotations
 
+import math
 import os
+import re
 import shutil
 import subprocess
 
@@ -164,12 +166,15 @@ def _source_has_audio(video) -> bool:
     return bool(pr.stdout.strip())
 
 
-def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
+def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
+                 color: list[str] | None = None) -> str:
     """-vf string for a keyframed block.
 
     Renders the clip on a transparent WxH canvas: per-frame scale / rotate /
     opacity (geq alpha), then overlays centered plus the x/y offset.
     `t` is segment-local (starts at 0 after setpts).
+    Slice 13: the color grade goes into the fg chain right after setpts, so
+    the whole graded frame is transformed + composited.
     """
     SX = _pw_expr(kf.get("scale"), 1.0, "t")
     ROT = _pw_expr(kf.get("rot"), 0.0, "t")
@@ -179,6 +184,7 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
     AA = _pw_expr(kf.get("op"), 1.0, "T")
     fg = ",".join([
         f"setpts=PTS/{speed}",
+        *(color or []),
         f"scale=iw*({SX}):ih*({SX}):eval=frame",
         f"rotate=a=({ROT})*PI/180:fillcolor=black@0",
         "format=rgba",
@@ -188,6 +194,81 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float) -> str:
     ov = (f"[bg][fg]overlay=x=(W-w)/2+({XX}):y=(H-h)/2+({YY})"
           f":eof_action=pass,format=yuv420p")
     return f"{fg};{bg};{ov}"
+
+
+# ---- Slice 13: color panel (exposure/contrast/saturation/temperature/vignette + LUTs) ----
+# block.color = {exposure, contrast, saturation, temperature, vignette} (all optional);
+# block.lut = ".cube" filename in backend/luts/. Applied per segment inside the
+# block's -vf chain, BEFORE captions/titles burn and BEFORE the keyframe overlay
+# (so text stays clean and the grade covers the whole frame).
+
+COLOR_DEFAULTS = {"exposure": 0.0, "contrast": 1.0, "saturation": 1.0,
+                  "temperature": 0.0, "vignette": 0.0}
+
+_LUT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+\.cube$")
+
+
+def _clean_color(raw) -> dict | None:
+    """Sanitize block['color'] -> dict or None (None when everything is default)."""
+    if not isinstance(raw, dict):
+        return None
+
+    def num(v, lo, hi, d):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return d
+        return min(max(f, lo), hi)
+
+    c = {
+        "exposure": num(raw.get("exposure"), -1, 1, 0.0),
+        "contrast": num(raw.get("contrast"), 0.5, 2, 1.0),
+        "saturation": num(raw.get("saturation"), 0, 2, 1.0),
+        "temperature": num(raw.get("temperature"), -1, 1, 0.0),
+        "vignette": num(raw.get("vignette"), 0, 1, 0.0),
+    }
+    if all(abs(c[k] - COLOR_DEFAULTS[k]) < 1e-9 for k in c):
+        return None
+    return c
+
+
+def _lut_path(name) -> str | None:
+    """Validated absolute path of a shipped .cube LUT, or None (also blocks traversal)."""
+    if not isinstance(name, str) or not _LUT_NAME_RE.match(name):
+        return None
+    d = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "luts"))
+    p = os.path.abspath(os.path.join(d, name))
+    if not p.startswith(d + os.sep) or not os.path.isfile(p):
+        return None
+    return p
+
+
+def _color_vf(c: dict | None, lut: str | None) -> list[str]:
+    """ffmpeg video filters for one block's color grade.
+
+    Filters at defaults are skipped, so the no-color path stays bit-identical
+    to Slice 12. Temperature uses colorbalance (one formula: t<0 flips the
+    signs for cool). LUT loads via lut3d after the parametric grade.
+    """
+    f: list[str] = []
+    if c:
+        exp, con, sat = c["exposure"], c["contrast"], c["saturation"]
+        if abs(exp) > 1e-9 or abs(con - 1.0) > 1e-9 or abs(sat - 1.0) > 1e-9:
+            f.append(f"eq=brightness={exp * 0.5:.4f}:contrast={con:.4f}:saturation={sat:.4f}")
+        t = c["temperature"]
+        if abs(t) > 1e-9:
+            f.append(f"colorbalance=rs={0.3 * t:.4f}:gs={0.08 * t:.4f}:bs={-0.35 * t:.4f}")
+        v = c["vignette"]
+        if v > 1e-9:
+            # Measured on ffmpeg's vignette filter: LARGER angle = stronger
+            # darkening (angle PI/2 crushes the frame, PI/10 only touches the
+            # extreme corners). Map amount 0..1 -> PI/8 (subtle) .. PI/2 (strong).
+            angle = math.pi / 8 + v * (math.pi / 2 - math.pi / 8)
+            f.append(f"vignette=a={angle:.4f}")
+    lut_file = _lut_path(lut)
+    if lut_file:
+        f.append(f"lut3d=file='{_esc(lut_file)}'")
+    return f
 
 
 # ---- Slice 12: transitions library ----
@@ -372,6 +453,7 @@ def run(job, report) -> dict:
             continue
         out_dur = (src_end - src_start) / speed
         kf = _clean_keyframes(b.get("keyframes"), out_dur)
+        color_vf = _color_vf(_clean_color(b.get("color")), b.get("lut"))
 
         srt_path = None
         cap_filters: list[str] = []
@@ -389,13 +471,15 @@ def run(job, report) -> dict:
         if kf:
             # ---- Slice 11: keyframed transform path (captions/titles stay
             # fixed on the canvas, applied after the overlay) ----
-            vf_str = _keyframe_vf(kf, W, H, out_dur, speed)
+            vf_str = _keyframe_vf(kf, W, H, out_dur, speed, color_vf)
             if cap_filters:
                 vf_str += "," + ",".join(cap_filters)
             vf_str += ",fps=30,settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
         else:
             # ---- original path + Slice 12 normalization ----
-            vf = [f"setpts=PTS/{speed}", norm_tail] + cap_filters
+            # Slice 13: color grade sits after setpts and before the
+            # geometry/pix_fmt normalization + captions/titles burn.
+            vf = [f"setpts=PTS/{speed}"] + color_vf + [norm_tail] + cap_filters
             vf_str = ",".join(vf)
 
         # Slice 12: every segment carries an audio stream so acrossfade's

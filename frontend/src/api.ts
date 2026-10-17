@@ -125,6 +125,7 @@ export const api = {
     }),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
+  luts: () => req<{ luts: string[] }>(`/api/luts`),
 }
 
 export function fmtTime(s: number): string {

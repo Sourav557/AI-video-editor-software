@@ -4,6 +4,7 @@ import Timeline, {
   Block, blockDur, layoutBlocks, newId,
   Kf, KfProp, Keyframes, KF_DEFAULTS, emptyKeyframes, kfVal, kfTransform,
   Transition, TRANSITION_TYPES, clampTransitionDur,
+  BlockColor, COLOR_DEFAULTS, COLOR_RANGES, COLOR_PRESETS,
 } from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
@@ -132,6 +133,68 @@ function KeyframesEditor({ block, localNow, dur, onChange, onCommit }: {
   )
 }
 
+/** Color grade panel for the selected clip (Slice 13): 5 sliders with live
+ *  values, one-click presets, LUT dropdown, reset. Slider drags update
+ *  transiently (no undo-history spam); committed on release. */
+function ColorPanel({ block, luts, onChange, onCommit }: {
+  block: Block
+  luts: string[]
+  onChange: (patch: Partial<Block>, transient?: boolean) => void
+  onCommit: () => void
+}) {
+  const color = block.color ?? {}
+  const setColor = (key: keyof BlockColor, v: number) => {
+    const r = COLOR_RANGES[key]
+    const cv = Math.min(r.max, Math.max(r.min, Number.isFinite(v) ? v : COLOR_DEFAULTS[key]))
+    onChange({ color: { ...color, [key]: cv } }, true)
+  }
+  const hasColor = block.color !== undefined || block.lut !== undefined
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-semibold text-xs" style={{ color: 'var(--cyan)' }}>COLOR</div>
+        {hasColor && (
+          <button className="text-[10px] faint hover:text-white" title="Restore default color grade"
+                  onClick={() => onChange({ color: undefined, lut: undefined })}>Reset</button>
+        )}
+      </div>
+      {(Object.keys(COLOR_RANGES) as (keyof BlockColor)[]).map((key) => {
+        const r = COLOR_RANGES[key]
+        const v = color[key] ?? COLOR_DEFAULTS[key]
+        return (
+          <div key={key} className="flex items-center gap-2 text-xs mb-1.5">
+            <span className="w-24 shrink-0 faint">{r.label}</span>
+            <input type="range" min={r.min} max={r.max} step={r.step} value={v} className="flex-1"
+                   onChange={(e) => setColor(key, Number(e.target.value))}
+                   onPointerUp={onCommit} onBlur={onCommit} />
+            <span className="tabular w-12 text-right">{v.toFixed(2)}</span>
+          </div>
+        )
+      })}
+      <div className="flex flex-wrap gap-1.5 mt-2">
+        {COLOR_PRESETS.map((p) => (
+          <button key={p.name} className="text-[11px] px-2 py-1 rounded card hover:text-white"
+                  title={`Apply the ${p.name} preset (then tweak the sliders)`}
+                  onClick={() => onChange({ color: { ...COLOR_DEFAULTS, ...p.values } })}>
+            {p.name}
+          </button>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 mt-2 text-xs">
+        <span className="faint w-24 shrink-0">LUT</span>
+        <select value={block.lut ?? ''}
+                onChange={(e) => onChange({ lut: e.target.value || undefined })}
+                className="card px-1.5 py-1 text-xs flex-1">
+          <option value="">None</option>
+          {luts.map((l) => (
+            <option key={l} value={l}>{l.replace(/\.cube$/, '').replace(/_/g, ' ')}</option>
+          ))}
+        </select>
+      </div>
+    </div>
+  )
+}
+
 export default function Studio({ projectId, fileName, segments, silences, language, srcDuration, onError, onImport }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -170,6 +233,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
   const [optSilence, setOptSilence] = useState(true)
   const [optFillers, setOptFillers] = useState(false)
   const [optCaptions, setOptCaptions] = useState(true)
+  const [luts, setLuts] = useState<string[]>([])
   const [seoData, setSeoData] = useState<any>(null)
   const [generatingSeo, setGeneratingSeo] = useState(false)
 
@@ -178,6 +242,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     api.waveform(projectId).then((w) => setPeaks(w.peaks ?? [])).catch(() => {})
     api.filmstrip(projectId).then(setFilmstrip).catch(() => {})
     api.audioList(projectId).then((a) => setAudioFiles(a.files ?? [])).catch(() => {})
+    api.luts().then((r) => setLuts(r.luts ?? [])).catch(() => {})
     api.editGet(projectId).then(() => setHasRender(true)).catch(() => {})
     // restore saved timeline, else seed
     api.timelineGet(projectId)
@@ -613,6 +678,12 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                         </div>
                       )
                     })()}
+                    <ColorPanel
+                      block={selected}
+                      luts={luts}
+                      onChange={(patch, transient) => updateSelected(patch, transient)}
+                      onCommit={() => commit(blocks)}
+                    />
                     <KeyframesEditor
                       block={selected}
                       localNow={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}

@@ -12,7 +12,47 @@ export interface Block {
   /** Transition into the next V1 block (set on the LEFT block of a join).
    *  Absence = hard cut. Rendered via ffmpeg xfade (+ acrossfade audio). */
   transition?: Transition
+  /** Slice 13: per-clip color grade (all fields optional; absence = defaults). */
+  color?: BlockColor
+  /** Slice 13: ".cube" LUT filename from backend/luts/ (absence = none). */
+  lut?: string
 }
+
+/** Per-clip color grade (Slice 13). All optional; undefined = default. */
+export interface BlockColor {
+  /** −1..1 → eq brightness −0.5..0.5 */
+  exposure?: number
+  /** 0.5..2 */
+  contrast?: number
+  /** 0..2 (0 = B&W) */
+  saturation?: number
+  /** −1..1 (negative = cool/blue, positive = warm/orange) */
+  temperature?: number
+  /** 0..1 vignette amount */
+  vignette?: number
+}
+
+/** Default color grade values (Slice 13). */
+export const COLOR_DEFAULTS: Required<BlockColor> = {
+  exposure: 0, contrast: 1, saturation: 1, temperature: 0, vignette: 0,
+}
+
+/** Slider bounds for the color panel (Slice 13). */
+export const COLOR_RANGES: Record<keyof BlockColor, { min: number; max: number; step: number; label: string }> = {
+  exposure: { min: -1, max: 1, step: 0.05, label: 'Exposure' },
+  contrast: { min: 0.5, max: 2, step: 0.05, label: 'Contrast' },
+  saturation: { min: 0, max: 2, step: 0.05, label: 'Saturation' },
+  temperature: { min: -1, max: 1, step: 0.05, label: 'Temperature' },
+  vignette: { min: 0, max: 1, step: 0.05, label: 'Vignette' },
+}
+
+/** One-click color presets (Slice 13) — set the sliders, user can tweak after. */
+export const COLOR_PRESETS: { name: string; values: BlockColor }[] = [
+  { name: 'Cinematic', values: { contrast: 1.25, saturation: 0.9, temperature: 0.15, vignette: 0.35 } },
+  { name: 'Warm', values: { temperature: 0.5, saturation: 1.15 } },
+  { name: 'Cool', values: { temperature: -0.5, saturation: 1.1 } },
+  { name: 'B&W', values: { saturation: 0, contrast: 1.15 } },
+]
 
 /** One transition: ffmpeg xfade type + overlap duration (seconds). */
 export interface Transition { type: string; dur: number }

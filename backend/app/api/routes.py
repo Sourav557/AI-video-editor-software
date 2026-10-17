@@ -1,6 +1,8 @@
 """REST API — the same surface the future agent, MCP server, and UI all use."""
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
@@ -387,6 +389,22 @@ def edit_file(pid: str):
     if not path.exists():
         raise HTTPException(404, "edit output not ready yet")
     return FileResponse(path, media_type="video/mp4", filename="edit.mp4")
+
+
+# ---- Slice 13: color panel — list shipped .cube LUTs ----
+
+@router.get("/luts")
+def list_luts():
+    """Names of .cube LUTs shipped in backend/luts/ (for the color panel dropdown)."""
+    import re
+    # backend/luts lives next to backend/app
+    lut_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "luts"))
+    names = []
+    if os.path.isdir(lut_dir):
+        for f in sorted(os.listdir(lut_dir)):
+            if re.match(r"^[A-Za-z0-9_-]+\.cube$", f) and os.path.isfile(os.path.join(lut_dir, f)):
+                names.append(f)
+    return {"luts": names}
 
 
 # ---- Slice 10: Filmora parity — filmstrip, project info, timeline persist ----
