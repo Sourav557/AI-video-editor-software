@@ -29,3 +29,4 @@ Thumbs.db
 .env
 *.pem
 /tmp/
+*.tsbuildinfo
