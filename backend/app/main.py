@@ -14,11 +14,13 @@ from fastapi.staticfiles import StaticFiles
 from . import workers  # noqa: F401  (self-registers with the orchestrator)
 from .api.routes import router
 from .config import FRONTEND_DIST
+from .net import sanitize_proxy_env
 from .orchestrator.runner import start as start_orchestrator
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    sanitize_proxy_env()
     start_orchestrator()
     yield
 

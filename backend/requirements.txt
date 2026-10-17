@@ -3,4 +3,7 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 faster-whisper>=1.0.0
+# NOTE: pin upstream PyAV. The `av>=19` fork on PyPI drops the `metadata_errors`
+# kwarg that faster-whisper's audio decoder requires.
+av>=12,<19
 pydantic>=2.0
