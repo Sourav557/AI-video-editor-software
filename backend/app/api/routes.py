@@ -41,14 +41,16 @@ def project_info(pid: str):
 
 @router.post("/projects/{pid}/analyze")
 def analyze(pid: str):
-    """Queue the Slice-1 analysis DAG: transcribe + silence (independent)."""
+    """Queue the Slice-1 analysis DAG: transcribe + silence (independent),
+    then waveform peaks for the timeline (depends on transcribe)."""
     if not project_exists(pid):
         raise HTTPException(404, "project not found")
     if get_video_path(pid) is None:
         raise HTTPException(400, "no video uploaded for this project")
     t = orchestrator.submit("transcribe", pid, priority=10)
     s = orchestrator.submit("silence", pid, priority=10)
-    return {"transcribe_job": t.id, "silence_job": s.id}
+    w = orchestrator.submit("waveform", pid, priority=5, depends_on=[t.id])
+    return {"transcribe_job": t.id, "silence_job": s.id, "waveform_job": w.id}
 
 
 @router.get("/jobs/{job_id}")
@@ -285,3 +287,63 @@ def montage_file(pid: str, filename: str):
     if not path.exists():
         raise HTTPException(404, "montage not ready yet")
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+# ---- Slice 8: studio (timeline) + autopilot (long-video self-edit) ----
+
+@router.get("/projects/{pid}/source/file")
+def source_file(pid: str):
+    """Stream the uploaded source video (preview monitor)."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    video = get_video_path(pid)
+    if video is None:
+        raise HTTPException(404, "no video uploaded")
+    return FileResponse(video, media_type="video/mp4",
+                        filename=f"source{video.suffix}")
+
+
+@router.get("/projects/{pid}/waveform")
+def get_waveform(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    wf = load_json(pid, "waveform.json")
+    if wf is None:
+        raise HTTPException(404, "no waveform yet — run Analyze first")
+    return wf
+
+
+@router.post("/projects/{pid}/autopilot")
+def autopilot_start(pid: str, body: dict):
+    """Queue the autopilot long-video self-edit."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if get_video_path(pid) is None:
+        raise HTTPException(400, "no video uploaded for this project")
+    job = orchestrator.submit("autopilot", pid, priority=15, params={
+        "remove_silence": body.get("remove_silence", True),
+        "silence_pad": float(body.get("silence_pad", 0.2)),
+        "remove_fillers": body.get("remove_fillers", False),
+        "captions": body.get("captions", True),
+    })
+    return {"autopilot_job": job.id}
+
+
+@router.get("/projects/{pid}/autopilot")
+def autopilot_get(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    edl = load_json(pid, "autopilot_edl.json")
+    if edl is None:
+        raise HTTPException(404, "no autopilot edit yet")
+    return edl
+
+
+@router.get("/projects/{pid}/autopilot/file")
+def autopilot_file(pid: str):
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    path = project_dir(pid) / "autopilot.mp4"
+    if not path.exists():
+        raise HTTPException(404, "autopilot output not ready yet")
+    return FileResponse(path, media_type="video/mp4", filename="autopilot.mp4")

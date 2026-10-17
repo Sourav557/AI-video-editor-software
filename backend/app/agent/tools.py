@@ -83,6 +83,15 @@ def _t_packaging(pid, args, report):
             "clips_packaged": r.get("clips_packaged")}
 
 
+def _t_autopilot(pid, args, report):
+    r = _run_worker("autopilot", pid,
+                    {"remove_silence": args.get("remove_silence", True),
+                     "remove_fillers": args.get("remove_fillers", False),
+                     "captions": args.get("captions", True)}, report)
+    return {"file": r.get("file"), "kept": r.get("kept_seconds"),
+            "removed": r.get("removed_seconds"), "cuts": r.get("cuts")}
+
+
 def _t_status(pid, args, report):
     t = load_json(pid, "transcript.json")
     c = load_json(pid, "clips.json")
@@ -112,6 +121,9 @@ TOOLS: dict[str, Tool] = {
                      '{"text": "...", "speaker": "Ryan"}', _t_voiceover),
     "packaging": Tool("packaging", "Generate keywords, titles, descriptions.",
                      "{}", _t_packaging),
+    "autopilot": Tool("autopilot", "Self-edit the full long video: cut silences/fillers, captions.",
+                      '{"remove_silence": true, "remove_fillers": false, "captions": true}',
+                      _t_autopilot),
     "project_status": Tool("project_status", "Summarize what is done so far.",
                           "{}", _t_status),
 }

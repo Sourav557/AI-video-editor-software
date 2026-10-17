@@ -36,7 +36,7 @@ export const api = {
     })
   },
   analyze: (pid: string) =>
-    req<{ transcribe_job: string; silence_job: string }>(
+    req<{ transcribe_job: string; silence_job: string; waveform_job: string }>(
       `/api/projects/${pid}/analyze`,
       { method: 'POST' },
     ),
@@ -82,6 +82,16 @@ export const api = {
       body: JSON.stringify({ message }),
     }),
   chatHistory: (pid: string) => req<{ messages: any[] }>(`/api/projects/${pid}/chat`),
+  waveform: (pid: string) => req<{ peaks: number[]; duration: number }>(`/api/projects/${pid}/waveform`),
+  autopilot: (pid: string, opts: { remove_silence: boolean; silence_pad: number; remove_fillers: boolean; captions: boolean }) =>
+    req<{ autopilot_job: string }>(`/api/projects/${pid}/autopilot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    }),
+  autopilotGet: (pid: string) => req<any>(`/api/projects/${pid}/autopilot`),
+  sourceUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/source/file`,
+  autopilotUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/autopilot/file`,
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }

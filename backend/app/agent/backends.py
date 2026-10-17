@@ -52,6 +52,10 @@ class RuleBackend:
          lambda m: [("analyze", {})]),
         (re.compile(r"\bpackag\w*\b|\bseo\b|\bkeyword\b|\btitle\b|\bthumbnail\b", re.I),
          lambda m: [("packaging", {})]),
+        (re.compile(r"\bautopilot\b|\bclean\s*up\b|\bself[\s-]?edit\b", re.I),
+         lambda m: [("autopilot", {"remove_silence": True,
+                                   "remove_fillers": bool(re.search(r"filler", m, re.I)),
+                                   "captions": True})]),
         (re.compile(r"\bvoiceover\b|\bnarrat\w+\b|\bsay\b|\bspeak\b", re.I),
          lambda m: [("voiceover", {"text": _voice_text(m) or ""})]),
         (re.compile(r"\brender\b", re.I),
@@ -105,6 +109,9 @@ class RuleBackend:
             elif tool == "packaging":
                 parts.append(f"Packaging done — {res['keywords']} keywords, "
                              f"{res['titles']} titles.")
+            elif tool == "autopilot":
+                parts.append(f"Autopilot edit done — kept {res['kept']}s, "
+                             f"cut {res['removed']}s in {res['cuts']} cuts → {res['file']}.")
             elif tool == "project_status":
                 bits = []
                 bits.append("transcribed ✓" if res["transcribed"]
