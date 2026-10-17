@@ -1,7 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, fmtTime, JobStatus, Segment, Silence } from './api'
 
-type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'done' | 'error'
+type Phase = 'idle' | 'uploading' | 'ready' | 'analyzing' | 'analyzed' | 'error'
+
+interface Clip {
+  index: number
+  start: number
+  end: number
+  duration: number
+  hook_text: string
+  score: number
+  breakdown: Record<string, number>
+  reason: string
+}
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('idle')
@@ -12,6 +23,11 @@ export default function App() {
   const [segments, setSegments] = useState<Segment[]>([])
   const [silences, setSilences] = useState<Silence[]>([])
   const [language, setLanguage] = useState('')
+  const [clips, setClips] = useState<Clip[]>([])
+  const [clipMsg, setClipMsg] = useState('')
+  const [finding, setFinding] = useState(false)
+  const [rendering, setRendering] = useState<Record<number, string>>({})
+  const [rendered, setRendered] = useState<Record<number, boolean>>({})
   const [error, setError] = useState('')
   const pollRef = useRef<number | null>(null)
 
@@ -19,40 +35,34 @@ export default function App() {
     if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null }
   }
 
-  const pollJobs = useCallback((ids: string[], pid: string) => {
-    stopPolling()
-    pollRef.current = window.setInterval(async () => {
-      try {
-        const statuses = await Promise.all(ids.map((id) => api.job(id)))
-        const map: Record<string, JobStatus> = {}
-        statuses.forEach((s) => (map[s.id] = s))
-        setJobs(map)
-        if (statuses.every((s) => s.status === 'done' || s.status === 'failed')) {
-          stopPolling()
-          const failed = statuses.find((s) => s.status === 'failed')
-          if (failed) {
-            setError(`Job "${failed.kind}" failed: ${failed.error}`)
-            setPhase('error')
-            return
+  const pollUntilDone = useCallback(
+    (ids: string[], onDone: () => Promise<void> | void) => {
+      stopPolling()
+      pollRef.current = window.setInterval(async () => {
+        try {
+          const statuses = await Promise.all(ids.map((id) => api.job(id)))
+          const map: Record<string, JobStatus> = {}
+          statuses.forEach((s) => (map[s.id] = s))
+          setJobs(map)
+          if (statuses.every((s) => s.status === 'done' || s.status === 'failed')) {
+            stopPolling()
+            const failed = statuses.find((s) => s.status === 'failed')
+            if (failed) { setError(`Job "${failed.kind}" failed: ${failed.error}`); setPhase('error'); return }
+            await onDone()
           }
-          const t = await api.transcript(pid)
-          setSegments(t.transcript?.segments ?? [])
-          setSilences(t.silence?.silences ?? [])
-          setLanguage(t.transcript?.language ?? '')
-          setPhase('done')
+        } catch (e: any) {
+          stopPolling(); setError(e.message); setPhase('error')
         }
-      } catch (e: any) {
-        stopPolling()
-        setError(e.message)
-        setPhase('error')
-      }
-    }, 1000)
-  }, [])
+      }, 1000)
+    },
+    [],
+  )
 
   useEffect(() => () => stopPolling(), [])
 
   const doUpload = async (file: File) => {
     setError(''); setPhase('uploading')
+    setClips([]); setClipMsg(''); setRendered({}); setRendering({})
     try {
       const { project_id, filename } = await api.upload(file)
       setProjectId(project_id); setFileName(filename)
@@ -66,18 +76,53 @@ export default function App() {
     setError(''); setPhase('analyzing')
     try {
       const { transcribe_job, silence_job } = await api.analyze(projectId)
-      pollJobs([transcribe_job, silence_job], projectId)
+      pollUntilDone([transcribe_job, silence_job], async () => {
+        const t = await api.transcript(projectId)
+        setSegments(t.transcript?.segments ?? [])
+        setSilences(t.silence?.silences ?? [])
+        setLanguage(t.transcript?.language ?? '')
+        setPhase('analyzed')
+      })
     } catch (e: any) { setError(e.message); setPhase('error') }
   }
 
+  const doFindClips = async () => {
+    if (!projectId) return
+    setError(''); setFinding(true)
+    try {
+      const { score_job } = await api.findClips(projectId)
+      pollUntilDone([score_job], async () => {
+        const c = await api.clips(projectId)
+        setClips(c.clips ?? [])
+        setClipMsg(c.message ?? '')
+        setFinding(false)
+      })
+    } catch (e: any) { setError(e.message); setFinding(false) }
+  }
+
+  const doRender = async (idx: number) => {
+    if (!projectId) return
+    setError('')
+    setRendering((r) => ({ ...r, [idx]: 'queued' }))
+    try {
+      const { render_job } = await api.renderClip(projectId, idx)
+      pollUntilDone([render_job], async () => {
+        setRendered((r) => ({ ...r, [idx]: true }))
+        setRendering((r) => { const n = { ...r }; delete n[idx]; return n })
+      })
+    } catch (e: any) {
+      setError(e.message)
+      setRendering((r) => { const n = { ...r }; delete n[idx]; return n })
+    }
+  }
+
   const analyzing = phase === 'analyzing'
+  const analyzed = phase === 'analyzed'
   const jobList = Object.values(jobs)
-  const overall =
-    jobList.length ? jobList.reduce((a, j) => a + j.progress, 0) / jobList.length : 0
+  const overall = jobList.length ? jobList.reduce((a, j) => a + j.progress, 0) / jobList.length : 0
 
   return (
     <div className="min-h-screen">
-      {/* Header */}
       <header className="border-b" style={{ borderColor: 'var(--border)' }}>
         <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -89,7 +134,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2 text-xs">
-            <span className="px-3 py-1 rounded-full card muted">Slice 1: Transcribe + Silence</span>
+            <span className="px-3 py-1 rounded-full card muted">Slice 2: Clips + Captions</span>
             <span className="px-3 py-1 rounded-full faint border" style={{ borderColor: 'var(--border)' }}>
               <span className="ai-glow font-semibold">100% offline after models</span>
             </span>
@@ -109,49 +154,31 @@ export default function App() {
             className="rounded-xl border-2 border-dashed p-10 text-center transition-colors"
             style={{ borderColor: dragOver ? 'var(--accent)' : 'var(--border)', background: 'var(--surface-2)' }}
           >
-            <input
-              type="file" accept="video/*" className="hidden" id="file-input"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) doUpload(f) }}
-            />
+            <input type="file" accept="video/*" className="hidden" id="file-input"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) doUpload(f) }} />
             <label htmlFor="file-input" className="cursor-pointer">
               <div className="text-4xl mb-2">🎬</div>
-              {phase === 'uploading'
-                ? <div className="muted">Uploading…</div>
-                : fileName
-                  ? <div><span className="font-medium">{fileName}</span><div className="faint text-sm mt-1">Drop another to replace</div></div>
-                  : <div><span className="font-medium">Drop a video here</span> <span className="muted">or click to browse</span></div>}
+              {phase === 'uploading' ? <div className="muted">Uploading…</div>
+                : fileName ? <div><span className="font-medium">{fileName}</span><div className="faint text-sm mt-1">Drop another to replace</div></div>
+                : <div><span className="font-medium">Drop a video here</span> <span className="muted">or click to browse</span></div>}
             </label>
           </div>
 
           <h2 className="font-semibold text-lg mt-6 mb-1">2 · Analyze</h2>
           <p className="muted text-sm mb-4">
-            The orchestrator queues two independent workers — <span className="ai-glow font-medium">transcription</span> (word timestamps)
-            and <span className="ai-glow font-medium">silence detection</span> — and runs them without blocking each other.
+            The orchestrator queues two independent workers — <span className="ai-glow font-medium">transcription</span> and{' '}
+            <span className="ai-glow font-medium">silence detection</span> — running without blocking each other.
           </p>
           <button className="btn-primary px-6 py-3 text-white" disabled={!projectId || analyzing || phase === 'uploading'} onClick={doAnalyze}>
             {analyzing ? 'Analyzing…' : '✨ Analyze video'}
           </button>
 
-          {analyzing && (
-            <div className="mt-4">
-              <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--surface-2)' }}>
-                <div className="h-full rounded-full transition-all" style={{ width: `${overall * 100}%`, background: 'var(--ai-gradient)' }} />
-              </div>
-              <div className="mt-2 space-y-1">
-                {jobList.map((j) => (
-                  <div key={j.id} className="text-sm muted flex justify-between">
-                    <span className="tabular">{j.kind}</span>
-                    <span>{j.status} · {Math.round(j.progress * 100)}%</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          {error && <div className="mt-4 text-sm px-4 py-3 rounded-lg" style={{ background: 'rgba(248,113,113,.12)', color: 'var(--danger)' }}>{error}</div>}
+          {analyzing && <ProgressBar overall={overall} jobList={jobList} />}
+          {error && <ErrorBox message={error} />}
         </section>
 
-        {/* Results */}
-        {(phase === 'done') && (
+        {/* Analysis results */}
+        {analyzed && (
           <>
             <section className="grid grid-cols-3 gap-4">
               <Stat label="Language" value={language || '—'} />
@@ -159,6 +186,64 @@ export default function App() {
               <Stat label="Silences" value={String(silences.length)} />
             </section>
 
+            {/* Clip engine */}
+            <section className="card p-6">
+              <h2 className="font-semibold text-lg mb-1">3 · Find viral clips</h2>
+              <p className="muted text-sm mb-4">
+                The quality engine scores every 15–60s moment on hook, completeness, pacing and length —
+                and <span className="ai-glow font-medium">rejects weak clips instead of padding the count</span>.
+              </p>
+              <button className="btn-primary px-6 py-3 text-white" disabled={finding} onClick={doFindClips}>
+                {finding ? 'Scoring moments…' : '🎯 Find clips'}
+              </button>
+              {finding && <ProgressBar overall={overall} jobList={jobList} />}
+              {clipMsg && !finding && <p className="muted text-sm mt-3">{clipMsg}</p>}
+
+              <div className="grid md:grid-cols-2 gap-4 mt-4">
+                {clips.map((c) => (
+                  <div key={c.index} className="card p-4" style={{ background: 'var(--surface-2)' }}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="tabular faint text-xs">{fmtTime(c.start)} → {fmtTime(c.end)} · {c.duration}s</div>
+                        <div className="font-medium mt-1">“{c.hook_text}”</div>
+                        <div className="muted text-sm mt-1">{c.reason}</div>
+                      </div>
+                      <ScoreRing score={c.score} />
+                    </div>
+                    <div className="mt-3 space-y-1">
+                      {Object.entries(c.breakdown).map(([k, v]) => (
+                        <div key={k} className="flex items-center gap-2 text-xs">
+                          <span className="muted w-24 shrink-0">{k.replace('_', ' ')}</span>
+                          <div className="flex-1 h-1.5 rounded-full" style={{ background: 'var(--bg)' }}>
+                            <div className="h-full rounded-full" style={{ width: `${Math.min(100, v * 100)}%`, background: 'var(--ai-gradient)' }} />
+                          </div>
+                          <span className="tabular faint w-8 text-right">{v.toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-4">
+                      {rendered[c.index] && projectId ? (
+                        <div className="space-y-2">
+                          <video controls className="w-full rounded-lg max-h-80" style={{ background: '#000' }}
+                            src={`/api/projects/${projectId}/clips/${c.index}/file`} />
+                          <a className="text-sm underline" style={{ color: 'var(--cyan)' }}
+                             href={`/api/projects/${projectId}/clips/${c.index}/file`} download>
+                            ⬇ Download 9:16 captioned clip
+                          </a>
+                        </div>
+                      ) : (
+                        <button className="btn-primary px-4 py-2 text-white text-sm"
+                                disabled={c.index in rendering} onClick={() => doRender(c.index)}>
+                          {c.index in rendering ? 'Rendering…' : '🎞 Render 9:16 captioned clip'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Transcript */}
             <section className="card p-6">
               <h2 className="font-semibold text-lg mb-3">Transcript <span className="faint text-sm font-normal">· word-level timestamps</span></h2>
               <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
@@ -171,26 +256,39 @@ export default function App() {
                 {segments.length === 0 && <div className="muted text-sm">No speech detected.</div>}
               </div>
             </section>
-
-            <section className="card p-6">
-              <h2 className="font-semibold text-lg mb-3">Silence gaps <span className="faint text-sm font-normal">· candidates for auto-cut</span></h2>
-              <div className="flex flex-wrap gap-2">
-                {silences.map((s, i) => (
-                  <span key={i} className="tabular text-xs px-3 py-1.5 rounded-full card muted">
-                    {fmtTime(s.start)} → {fmtTime(s.end)} <span className="faint">({s.duration}s)</span>
-                  </span>
-                ))}
-                {silences.length === 0 && <div className="muted text-sm">No silences found.</div>}
-              </div>
-            </section>
           </>
         )}
 
         <footer className="faint text-xs text-center pt-4">
-          Slice 1 of the roadmap — next: clip quality engine, captions, multi-platform export. Nothing leaves your machine.
+          Slice 2 of the roadmap — next: multi-platform export presets, then Qwen3-TTS voiceover. Nothing leaves your machine.
         </footer>
       </main>
     </div>
+  )
+}
+
+function ProgressBar({ overall, jobList }: { overall: number; jobList: JobStatus[] }) {
+  return (
+    <div className="mt-4">
+      <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--surface-2)' }}>
+        <div className="h-full rounded-full transition-all" style={{ width: `${overall * 100}%`, background: 'var(--ai-gradient)' }} />
+      </div>
+      <div className="mt-2 space-y-1">
+        {jobList.map((j) => (
+          <div key={j.id} className="text-sm muted flex justify-between">
+            <span className="tabular">{j.kind}</span>
+            <span>{j.status} · {Math.round(j.progress * 100)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ErrorBox({ message }: { message: string }) {
+  return (
+    <div className="mt-4 text-sm px-4 py-3 rounded-lg"
+         style={{ background: 'rgba(248,113,113,.12)', color: 'var(--danger)' }}>{message}</div>
   )
 }
 
@@ -199,6 +297,17 @@ function Stat({ label, value }: { label: string; value: string }) {
     <div className="card p-4">
       <div className="faint text-xs uppercase tracking-wide">{label}</div>
       <div className="text-2xl font-bold mt-1 tabular">{value}</div>
+    </div>
+  )
+}
+
+function ScoreRing({ score }: { score: number }) {
+  const pct = Math.round(score * 100)
+  const color = score >= 0.7 ? 'var(--success)' : score >= 0.55 ? 'var(--warning)' : 'var(--danger)'
+  return (
+    <div className="w-14 h-14 rounded-full flex items-center justify-center shrink-0 font-bold tabular"
+         style={{ border: `3px solid ${color}` }}>
+      {pct}
     </div>
   )
 }

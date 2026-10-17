@@ -24,6 +24,7 @@ class Job:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     depends_on: list = field(default_factory=list)
     priority: int = 0
+    params: dict = field(default_factory=dict)
     status: str = QUEUED
     progress: float = 0.0
     result: dict | None = None
@@ -43,9 +44,11 @@ class Orchestrator:
         """Register a worker: fn(job, report_progress_0_to_1) -> dict result."""
         self._workers[kind] = fn
 
-    def submit(self, kind: str, project_id: str, depends_on=(), priority: int = 0) -> Job:
+    def submit(self, kind: str, project_id: str, depends_on=(), priority: int = 0,
+               params: dict | None = None) -> Job:
         job = Job(kind=kind, project_id=project_id,
-                  depends_on=list(depends_on), priority=priority)
+                  depends_on=list(depends_on), priority=priority,
+                  params=params or {})
         with self.lock:
             self.jobs[job.id] = job
         return job

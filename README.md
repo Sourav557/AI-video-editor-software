@@ -43,8 +43,8 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 ## Roadmap
 
 - [x] Slice 0 — repo scaffold, orchestrator skeleton, local dev flow
-- [ ] Slice 1 — upload → faster-whisper transcription (word timestamps) + silence detection
-- [ ] Slice 2 — clip quality engine (moment scoring, hooks) + caption burn-in
+- [x] Slice 1 — upload → faster-whisper transcription (word timestamps) + silence detection
+- [ ] Slice 2 — clip quality engine (moment scoring, hooks) + caption burn-in (9:16)
 - [ ] Slice 3 — multi-platform export (9:16 reframe, presets)
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)

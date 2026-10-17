@@ -35,6 +35,12 @@ export const api = {
       { method: 'POST' },
     ),
   job: (id: string) => req<JobStatus>(`/api/jobs/${id}`),
+  findClips: (pid: string) =>
+    req<{ score_job: string }>(`/api/projects/${pid}/clips`, { method: 'POST' }),
+  clips: (pid: string) =>
+    req<{ clips: any[]; message: string }>(`/api/projects/${pid}/clips`),
+  renderClip: (pid: string, idx: number) =>
+    req<{ render_job: string }>(`/api/projects/${pid}/clips/${idx}/render`, { method: 'POST' }),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
 }
