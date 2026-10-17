@@ -56,6 +56,7 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 - [x] Slice 11 — keyframed transforms (position/scale/rotation/opacity) + keyframe UI
 - [x] Slice 12 — transitions library (xfade crossfades + acrossfade audio, 14 types, timeline ⤨ markers)
 - [x] Slice 13 — color panel (exposure/contrast/saturation/temperature/vignette + LUTs)
+- [x] Slice 14 — speed ramping (piecewise-constant), reverse playback, freeze frame
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)
 - [ ] Slice 6 — editing agent + style profiles

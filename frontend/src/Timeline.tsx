@@ -16,6 +16,16 @@ export interface Block {
   color?: BlockColor
   /** Slice 13: ".cube" LUT filename from backend/luts/ (absence = none). */
   lut?: string
+  /** Slice 14: piecewise-constant speed profile. Each ramp's t is seconds in
+   *  SOURCE timebase (relative to srcStart), ascending. The span [t_i, t_{i+1}]
+   *  plays at speed v_i; the span before the first ramp point uses `speed`.
+   *  Overrides `speed` for duration. No bezier curves. */
+  speed_ramps?: SpeedRamp[]
+  /** Slice 14: play the block's source range backward. */
+  reversed?: boolean
+  /** Slice 14: freeze-frame — hold the frame at source time srcStart+at as a
+   *  silent still for dur seconds (inserted into the output). */
+  freeze?: FreezeFrame
 }
 
 /** Per-clip color grade (Slice 13). All optional; undefined = default. */
@@ -115,7 +125,94 @@ export function blockHasKeyframes(b: Block): boolean {
   return !!k && (k.x.length + k.y.length + k.scale.length + k.rot.length + k.op.length) > 0
 }
 
-export const blockDur = (b: Block) => Math.max(0.01, (b.srcEnd - b.srcStart) / b.speed)
+/** One speed-ramp keyframe (Slice 14). t = seconds in SOURCE timebase,
+ *  relative to the block's srcStart. */
+export interface SpeedRamp { t: number; speed: number }
+
+/** Freeze-frame spec (Slice 14). at = seconds in source timebase relative
+ *  to the block's srcStart; dur = still length in seconds (inserted). */
+export interface FreezeFrame { at: number; dur: number }
+
+const clampSpeed = (v: number) => Math.min(4, Math.max(0.25, v))
+
+/** Slice 14: source-time spans [(t0, t1, speed)] for a block's ramp profile.
+ *  Mirrors backend _clean_ramps() exactly — both must agree on durations.
+ *  Empty ramps → single span at the block's constant speed. */
+export function rampSpans(b: Block): { t0: number; t1: number; speed: number }[] {
+  const span = Math.max(0, b.srcEnd - b.srcStart)
+  const pts: { t: number; speed: number }[] = []
+  for (const r of b.speed_ramps ?? []) {
+    if (!r || !isFinite(r.t) || !isFinite(r.speed) || r.speed <= 0) continue
+    pts.push({ t: Math.min(Math.max(r.t, 0), span), speed: clampSpeed(r.speed) })
+  }
+  pts.sort((a, c) => a.t - c.t)
+  const ded: { t: number; speed: number }[] = []
+  for (const p of pts) {
+    const last = ded[ded.length - 1]
+    if (last && Math.abs(last.t - p.t) < 1e-9) ded[ded.length - 1] = p // last wins
+    else ded.push(p)
+  }
+  const bounds = [0, ...ded.map((p) => p.t), span]
+  const uniq: number[] = []
+  for (const x of bounds) if (!uniq.some((u) => Math.abs(u - x) < 1e-9)) uniq.push(x)
+  const out: { t0: number; t1: number; speed: number }[] = []
+  for (let i = 0; i < uniq.length - 1; i++) {
+    const b0 = uniq[i], b1 = uniq[i + 1]
+    if (b1 - b0 <= 1e-9) continue
+    const rp = ded.find((p) => Math.abs(p.t - b0) < 1e-9)
+    out.push({ t0: b0, t1: b1, speed: rp ? rp.speed : clampSpeed(b.speed) })
+  }
+  return out
+}
+
+/** Slice 14: block output duration — Σ span/speed over ramp spans, plus the
+ *  freeze still (reversed changes direction, not duration). */
+export const blockDur = (b: Block) => {
+  const base = rampSpans(b).reduce((a, s) => a + (s.t1 - s.t0) / s.speed, 0)
+  const frz = b.freeze && b.freeze.dur > 0 ? b.freeze.dur : 0
+  return Math.max(0.01, base + frz)
+}
+
+/** Slice 14: map a block-local OUTPUT time (seconds) back to source-relative
+ *  time (seconds from srcStart), inverting the ramp profile, freeze-still
+ *  insertion and reverse mirroring. Used for "at playhead" ramp/freeze edits. */
+export function blockOutToSrc(b: Block, tOut: number): number {
+  const span = Math.max(0, b.srcEnd - b.srcStart)
+  const spans = rampSpans(b)
+  const frz = b.freeze && b.freeze.dur > 0
+    ? { at: Math.min(Math.max(b.freeze.at, 0), span), dur: b.freeze.dur }
+    : null
+  interface P { s0: number; s1: number; speed: number; still: boolean; outDur: number }
+  let seq: P[]
+  if (frz) {
+    const at = frz.at, pre: P[] = [], post: P[] = []
+    for (const s of spans) {
+      if (s.t1 <= at + 1e-9) pre.push({ s0: s.t0, s1: Math.min(s.t1, at), speed: s.speed, still: false, outDur: 0 })
+      else if (s.t0 >= at - 1e-9) post.push({ s0: Math.max(s.t0, at), s1: s.t1, speed: s.speed, still: false, outDur: 0 })
+      else {
+        pre.push({ s0: s.t0, s1: at, speed: s.speed, still: false, outDur: 0 })
+        post.push({ s0: at, s1: s.t1, speed: s.speed, still: false, outDur: 0 })
+      }
+    }
+    seq = [...pre, { s0: at, s1: at, speed: 1, still: true, outDur: frz.dur }, ...post]
+  } else {
+    seq = spans.map((s) => ({ s0: s.t0, s1: s.t1, speed: s.speed, still: false, outDur: 0 }))
+  }
+  for (const p of seq) p.outDur = p.still ? p.outDur : (p.s1 - p.s0) / p.speed
+  if (b.reversed) seq = [...seq].reverse()
+  const total = seq.reduce((a, p) => a + p.outDur, 0)
+  const t = Math.min(Math.max(tOut, 0), total)
+  let acc = 0
+  for (const p of seq) {
+    if (t <= acc + p.outDur + 1e-9) {
+      if (p.still) return p.s0
+      const local = Math.min(Math.max(t - acc, 0), p.outDur)
+      return b.reversed ? p.s1 - local * p.speed : p.s0 + local * p.speed
+    }
+    acc += p.outDur
+  }
+  return b.reversed ? 0 : span
+}
 
 /** Lay blocks end-to-end; returns edit-start per block and total. */
 export function layoutBlocks(blocks: Block[]): { starts: number[]; total: number } {

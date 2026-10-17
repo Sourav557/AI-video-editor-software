@@ -5,6 +5,7 @@ import Timeline, {
   Kf, KfProp, Keyframes, KF_DEFAULTS, emptyKeyframes, kfVal, kfTransform,
   Transition, TRANSITION_TYPES, clampTransitionDur,
   BlockColor, COLOR_DEFAULTS, COLOR_RANGES, COLOR_PRESETS,
+  SpeedRamp, rampSpans, blockOutToSrc,
 } from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
@@ -191,6 +192,102 @@ function ColorPanel({ block, luts, onChange, onCommit }: {
           ))}
         </select>
       </div>
+    </div>
+  )
+}
+
+/** Slice 14: speed ramps + reverse + freeze-frame editor for the selected clip.
+ *
+ *  Ramp `t` is in SOURCE timebase (seconds from the block's srcStart);
+ *  "＋ at playhead" converts the edit-timebase playhead into block-local
+ *  output time, then inverts the current ramp/reverse/freeze profile via
+ *  blockOutToSrc(). Speed between ramp points is piecewise-constant —
+ *  bezier curves are out of scope (documented).
+ */
+function TimeFXPanel({ block, localOut, onChange }: {
+  block: Block
+  localOut: number
+  onChange: (patch: Partial<Block>) => void
+}) {
+  const span = Math.max(0, block.srcEnd - block.srcStart)
+  const ramps = block.speed_ramps ?? []
+  const [freezeDur, setFreezeDur] = useState(block.freeze?.dur ?? 2)
+
+  const setRamps = (rs: SpeedRamp[]) =>
+    onChange({ speed_ramps: rs.length ? [...rs].sort((a, b) => a.t - b.t) : undefined })
+
+  const addRampAtPlayhead = () => {
+    const srcT = Math.round(Math.min(Math.max(blockOutToSrc(block, localOut), 0), span) * 10) / 10
+    const containing = rampSpans(block).find((s) => srcT >= s.t0 - 1e-9 && srcT < s.t1 + 1e-9)
+    const speed = Math.round((containing ? containing.speed : block.speed) * 10) / 10
+    setRamps([...ramps, { t: srcT, speed }])
+  }
+
+  const addFreezeAtPlayhead = () => {
+    const at = Math.round(Math.min(Math.max(blockOutToSrc(block, localOut), 0), span) * 10) / 10
+    onChange({ freeze: { at, dur: Math.max(0.1, freezeDur) } })
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+      <div className="font-semibold text-xs mb-2" style={{ color: 'var(--cyan)' }}>TIME FX</div>
+
+      <div className="faint text-[11px] mb-1">Speed ramps <span className="opacity-70">(t = source-sec from clip start)</span></div>
+      {ramps.map((r, i) => (
+        <div key={i} className="flex items-center gap-1.5 text-xs mb-1">
+          <span className="faint">t</span>
+          <input type="number" min={0} max={span} step={0.1} value={r.t}
+                 onChange={(e) => setRamps(ramps.map((x, j) => j === i
+                   ? { ...x, t: Math.min(Math.max(Number(e.target.value) || 0, 0), span) } : x))}
+                 className="card px-1.5 py-1 text-xs w-16 tabular" />
+          <span className="faint">s →</span>
+          <input type="number" min={0.25} max={4} step={0.1} value={r.speed}
+                 onChange={(e) => setRamps(ramps.map((x, j) => j === i
+                   ? { ...x, speed: Math.min(4, Math.max(0.25, Number(e.target.value) || 1)) } : x))}
+                 className="card px-1.5 py-1 text-xs w-14 tabular" />
+          <span className="faint">x</span>
+          <button className="text-[11px] faint hover:text-white ml-auto" title="Delete ramp point"
+                  onClick={() => setRamps(ramps.filter((_, j) => j !== i))}>✕</button>
+        </div>
+      ))}
+      <div className="flex gap-2 mt-1">
+        <button className="text-[11px] px-2 py-1 rounded card hover:text-white"
+                onClick={addRampAtPlayhead}>＋ ramp at playhead</button>
+        {ramps.length > 0 && (
+          <button className="text-[11px] faint hover:text-white" onClick={() => setRamps([])}>
+            Clear ramps
+          </button>
+        )}
+      </div>
+      {ramps.length > 0 && (
+        <div className="text-[10px] mt-1" style={{ color: 'var(--cyan)' }}>
+          ⚡ ramps active — the constant speed slider is ignored for duration.
+        </div>
+      )}
+
+      <label className="flex items-center gap-2 mt-3 text-xs">
+        <input type="checkbox" checked={!!block.reversed}
+               onChange={(e) => onChange({ reversed: e.target.checked || undefined })} />
+        Play backward <span className="faint">(captions off on reversed clips)</span>
+      </label>
+
+      <div className="faint text-[11px] mt-3 mb-1">Freeze frame <span className="opacity-70">(inserts a silent still)</span></div>
+      {block.freeze ? (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="tabular">❄ @{block.freeze.at.toFixed(1)}s × {block.freeze.dur.toFixed(1)}s</span>
+          <button className="text-[11px] faint hover:text-white ml-auto"
+                  onClick={() => onChange({ freeze: undefined })}>Clear</button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5 text-xs">
+          <input type="number" min={0.1} max={30} step={0.5} value={freezeDur}
+                 onChange={(e) => setFreezeDur(Math.min(30, Math.max(0.1, Number(e.target.value) || 2)))}
+                 className="card px-1.5 py-1 text-xs w-14 tabular" />
+          <span className="faint">s</span>
+          <button className="text-[11px] px-2 py-1 rounded card hover:text-white"
+                  onClick={addFreezeAtPlayhead}>❄ Freeze at playhead</button>
+        </div>
+      )}
     </div>
   )
 }
@@ -636,6 +733,9 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                                  onChange={(e) => updateSelected({ speed: Number(e.target.value) })} />
                           <span className="tabular">{selected.speed.toFixed(1)}x</span>
                         </div>
+                        {(selected.speed_ramps?.length ?? 0) > 0 && (
+                          <div className="text-[10px]" style={{ color: 'var(--cyan)' }}>⚡ ramps override</div>
+                        )}
                       </div>
                     </div>
                     <label className="flex items-center gap-2 mt-2 text-xs">
@@ -643,6 +743,12 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                              onChange={(e) => updateSelected({ muted: e.target.checked })} />
                       Mute this clip
                     </label>
+                    <TimeFXPanel
+                      key={selected.id}
+                      block={selected}
+                      localOut={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}
+                      onChange={(patch) => updateSelected(patch)}
+                    />
                     {(() => {
                       const idx = blocks.findIndex((b) => b.id === selected.id)
                       if (idx === -1 || idx >= blocks.length - 1) return null
