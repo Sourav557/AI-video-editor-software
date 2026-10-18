@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react'
-import { api } from './api'
+import { useEffect, useRef, useState } from 'react'
+import { api, fmtTime } from './api'
 
 interface Speaker { name: string; description: string; native: string }
 
-export default function VoiceStudio({ projectId }: { projectId: string }) {
-  const [tab, setTab] = useState<'preset' | 'clone'>('preset')
+export default function VoiceStudio({ projectId, onRecorded }: { projectId: string; onRecorded?: () => void }) {
+  const [tab, setTab] = useState<'preset' | 'clone' | 'record'>('preset')
   const [speakers, setSpeakers] = useState<Speaker[]>([])
   const [languages, setLanguages] = useState<string[]>([])
   const [text, setText] = useState('')
@@ -18,6 +18,13 @@ export default function VoiceStudio({ projectId }: { projectId: string }) {
   const [progress, setProgress] = useState(0)
   const [audioUrl, setAudioUrl] = useState('')
   const [error, setError] = useState('')
+  /** Slice 17: mic recording state */
+  const [recording, setRecording] = useState(false)
+  const [recElapsed, setRecElapsed] = useState(0)
+  const [uploading, setUploading] = useState(false)
+  const recRef = useRef<MediaRecorder | null>(null)
+  const chunksRef = useRef<Blob[]>([])
+  const timerRef = useRef<number | null>(null)
 
   useEffect(() => {
     api.ttsVoices()
@@ -55,16 +62,110 @@ export default function VoiceStudio({ projectId }: { projectId: string }) {
 
   const canGo = text.trim().length > 0 && !busy
 
+  /** Slice 17: record from the microphone, upload as a voiceover. */
+  const pickMime = (): { mime: string | undefined; ext: string } => {
+    for (const m of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(m))
+        return { mime: m, ext: m.includes('mp4') ? 'm4a' : 'webm' }
+    }
+    return { mime: undefined, ext: 'webm' }
+  }
+
+  const startRecord = async () => {
+    setError('')
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('This browser cannot access the microphone.')
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const { mime, ext } = pickMime()
+      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
+      chunksRef.current = []
+      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data) }
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop())
+        const blob = new Blob(chunksRef.current, { type: rec.mimeType || 'audio/webm' })
+        setUploading(true)
+        try {
+          const file = new File([blob], `voiceover.${ext}`, { type: blob.type })
+          const r = await api.audioUpload(projectId, file)
+          setAudioUrl(`/api/projects/${projectId}/audio/${r.file}`)
+          onRecorded?.()
+        } catch (e: any) { setError(e.message) }
+        finally { setUploading(false) }
+      }
+      rec.start()
+      recRef.current = rec
+      setRecording(true)
+      setRecElapsed(0)
+      timerRef.current = window.setInterval(() => setRecElapsed((s) => s + 1), 1000)
+    } catch (e: any) {
+      setError(e?.name === 'NotAllowedError'
+        ? 'Microphone permission denied — allow mic access and try again.'
+        : `Could not start recording: ${e?.message ?? e}`)
+    }
+  }
+
+  const stopRecord = () => {
+    if (timerRef.current) { window.clearInterval(timerRef.current); timerRef.current = null }
+    setRecording(false)
+    recRef.current?.stop()
+    recRef.current = null
+  }
+
+  useEffect(() => () => {
+    if (timerRef.current) window.clearInterval(timerRef.current)
+    if (recRef.current?.state !== 'inactive') recRef.current?.stop()
+  }, [])
+
   return (
     <div>
       <div className="flex gap-2 mb-4">
-        {(['preset', 'clone'] as const).map((t) => (
+        {(['preset', 'clone', 'record'] as const).map((t) => (
           <button key={t} onClick={() => setTab(t)}
             className={`text-sm px-4 py-2 rounded-full ${tab === t ? 'btn-primary text-white' : 'card muted'}`}>
-            {t === 'preset' ? '🎙 Preset voice' : '🧬 Clone a voice'}
+            {t === 'preset' ? '🎙 Preset voice' : t === 'clone' ? '🧬 Clone a voice' : '● Record mic'}
           </button>
         ))}
       </div>
+
+      {tab === 'record' && (
+        <div className="space-y-3">
+          <p className="faint text-xs">Record a voiceover with your microphone. It saves into the project's Audio tab
+            (media bin), where you can preview and reuse it. Dropping it onto the timeline at the playhead is not
+            built yet — timeline audio-clip placement is coming in a later slice.</p>
+          <div className="flex items-center gap-4">
+            {!recording ? (
+              <button className="btn-primary px-6 py-3 text-white" disabled={uploading} onClick={startRecord}>
+                ● Record voiceover
+              </button>
+            ) : (
+              <button className="px-6 py-3 rounded-lg text-white font-semibold"
+                      style={{ background: 'var(--danger)' }} onClick={stopRecord}>
+                ⏹ Stop &amp; save
+              </button>
+            )}
+            {recording && (
+              <span className="flex items-center gap-2 text-sm">
+                <span className="w-2.5 h-2.5 rounded-full animate-pulse" style={{ background: 'var(--danger)' }} />
+                <span className="tabular">{fmtTime(recElapsed)}</span>
+              </span>
+            )}
+            {uploading && <span className="faint text-xs">Uploading…</span>}
+          </div>
+          {error && <div className="mt-3 text-sm px-4 py-3 rounded-lg" style={{ background: 'rgba(248,113,113,.12)', color: 'var(--danger)' }}>{error}</div>}
+          {audioUrl && (
+            <div className="mt-2 space-y-2">
+              <audio controls src={audioUrl} className="w-full" />
+              <a className="text-sm underline" style={{ color: 'var(--cyan)' }} href={audioUrl} download>⬇ Download recording</a>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab !== 'record' && (
+      <>
 
       <textarea value={text} onChange={(e) => setText(e.target.value)} rows={3}
         placeholder="Type what the voice should say…"
@@ -125,6 +226,8 @@ export default function VoiceStudio({ projectId }: { projectId: string }) {
           <audio controls src={audioUrl} className="w-full" />
           <a className="text-sm underline" style={{ color: 'var(--cyan)' }} href={audioUrl} download>⬇ Download voiceover (.wav)</a>
         </div>
+      )}
+      </>
       )}
     </div>
   )

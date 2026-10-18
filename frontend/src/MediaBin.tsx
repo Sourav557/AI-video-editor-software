@@ -15,6 +15,9 @@ interface Props {
   setMediaTab: (t: MediaTab) => void
   audioFiles: string[]
   titles: TitleT[]
+  /** Slice 17: preview snapshots + screen recordings listed in the Media tab. */
+  snapshots: string[]
+  recordings: string[]
   onAddTitle: (text: string, size: number, position: 'top' | 'bottom') => void
   onDeleteTitle: (id: string) => void
   currentTime: number
@@ -110,6 +113,25 @@ export default function MediaBin(p: Props) {
                     <div className="text-[10px] px-1.5 py-1 truncate" title={p.fileName}>{p.fileName}</div>
                   </div>
                 )}
+                {/* Slice 17: screen recordings (imported to the bin on stop) */}
+                {p.recordings.filter(matchQ).map((f) => (
+                  <div key={f} className="relative rounded-xl overflow-hidden card group">
+                    <video src={api.recordingUrl(p.projectId, f)} preload="metadata" muted playsInline
+                           className="w-full aspect-video object-cover" style={{ background: '#000' }} />
+                    <span className="absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded"
+                          style={{ background: 'rgba(248,113,113,.85)', color: '#fff' }}>⏺ screen</span>
+                    <div className="text-[10px] px-1.5 py-1 truncate" title={f}>{f}</div>
+                  </div>
+                ))}
+                {/* Slice 17: preview snapshots */}
+                {p.snapshots.filter(matchQ).map((f) => (
+                  <div key={f} className="relative rounded-xl overflow-hidden card group">
+                    <img src={api.snapshotUrl(p.projectId, f)} className="w-full aspect-video object-cover" alt="" />
+                    <span className="absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded"
+                          style={{ background: 'rgba(0,0,0,.7)' }}>📷</span>
+                    <div className="text-[10px] px-1.5 py-1 truncate" title={f}>{f}</div>
+                  </div>
+                ))}
               </div>
             </div>
           </div>

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, fmtTC, fmtTime, JobStatus, Segment, Silence } from './api'
 import Timeline, {
-  Block, blockDur, layoutBlocks, newId,
+  Block, blockDur, layoutBlocks, newId, MarkerT,
   Kf, KfProp, Keyframes, KF_DEFAULTS, emptyKeyframes, kfVal, kfTransform,
   Transition, TRANSITION_TYPES, clampTransitionDur,
   BlockColor, COLOR_DEFAULTS, COLOR_RANGES, COLOR_PRESETS,
@@ -584,6 +584,15 @@ export default function Studio({ projectId, fileName, segments, silences, langua
 
   const [blocks, setBlocks] = useState<Block[]>([])
   const [titles, setTitles] = useState<TitleT[]>([])
+  /** Slice 17: timeline markers [{id, t, label}]. */
+  const [markers, setMarkers] = useState<MarkerT[]>([])
+  /** Slice 17: snapshots + screen recordings for the media bin. */
+  const [snapshots, setSnapshots] = useState<string[]>([])
+  const [recordings, setRecordings] = useState<string[]>([])
+  /** Slice 17: screen recording state (elapsed timer). */
+  const [screenRec, setScreenRec] = useState<string | null>(null)
+  const [screenElapsed, setScreenElapsed] = useState(0)
+  const [snapBusy, setSnapBusy] = useState(false)
   const [hist, setHist] = useState<Block[][]>([])
   const [hIdx, setHIdx] = useState(-1)
   const [tool, setTool] = useState<'select' | 'razor'>('select')
@@ -610,10 +619,20 @@ export default function Studio({ projectId, fileName, segments, silences, langua
   const [projWH, setProjWH] = useState<{ w: number; h: number } | null>(null)
 
   // ---------- load ----------
+  /** Slice 17: refresh helpers for media-bin extras + audio list. */
+  const refreshSnapshots = () =>
+    api.snapshots(projectId).then((s) => setSnapshots(s.files ?? [])).catch(() => {})
+  const refreshRecordings = () =>
+    api.recordings(projectId).then((r) => setRecordings(r.files ?? [])).catch(() => {})
+  const refreshAudio = () =>
+    api.audioList(projectId).then((a) => setAudioFiles(a.files ?? [])).catch(() => {})
+
   useEffect(() => {
     api.waveform(projectId).then((w) => setPeaks(w.peaks ?? [])).catch(() => {})
     api.filmstrip(projectId).then(setFilmstrip).catch(() => {})
-    api.audioList(projectId).then((a) => setAudioFiles(a.files ?? [])).catch(() => {})
+    refreshAudio()
+    refreshSnapshots()
+    refreshRecordings()
     api.luts().then((r) => setLuts(r.luts ?? [])).catch(() => {})
     api.projectInfo(projectId)
       .then((i: any) => { if (i?.width && i?.height) setProjWH({ w: i.width, h: i.height }) })
@@ -625,6 +644,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
         if (tl.blocks?.length) {
           setBlocks(tl.blocks); setHist([tl.blocks]); setHIdx(0)
           setTitles(tl.titles ?? [])
+          setMarkers(Array.isArray(tl.markers) ? tl.markers : [])
         } else {
           seedFromAutopilot()
         }
@@ -655,10 +675,10 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     if (!loadedTl.current) return
     if (saveTimer.current) window.clearTimeout(saveTimer.current)
     saveTimer.current = window.setTimeout(() => {
-      api.timelineSave(projectId, blocks, titles).catch(() => {})
+      api.timelineSave(projectId, blocks, titles, markers).catch(() => {})
     }, 800)
     return () => { if (saveTimer.current) window.clearTimeout(saveTimer.current) }
-  }, [blocks, titles, projectId])
+  }, [blocks, titles, markers, projectId])
 
   // ---------- editing ops ----------
   const commit = useCallback((next: Block[], transient = false) => {
@@ -695,6 +715,18 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     setSelectedId(null)
   }, [selectedId, selectedTitleId, blocks, commit, trackLocked])
 
+  // ---------- Slice 17: timeline markers ----------
+  const addMarker = useCallback(() => {
+    setMarkers((ms) => [...ms, {
+      id: newId(),
+      t: Math.round(currentTime * 100) / 100,
+      label: `Marker ${ms.length + 1}`,
+    }])
+  }, [currentTime])
+  const deleteMarker = useCallback((id: string) => {
+    setMarkers((ms) => ms.filter((m) => m.id !== id))
+  }, [])
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement
@@ -704,16 +736,52 @@ export default function Studio({ projectId, fileName, segments, silences, langua
       if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); redo() }
       if (e.key === 'v' || e.key === 'V') setTool('select')
       if (e.key === 'c' || e.key === 'C') setTool('razor')
+      if (e.key === 'm' || e.key === 'M') { e.preventDefault(); addMarker() }  // Slice 17: marker
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [deleteSelected, undo, redo])
+  }, [deleteSelected, undo, redo, addMarker])
 
   const addTitle = (text: string, size: number, position: 'top' | 'bottom') => {
     const t: TitleT = { id: newId(), text, start: currentTime, end: currentTime + 3, size, position }
     setTitles((ts) => [...ts, t])
     setSelectedTitleId(t.id)
   }
+
+  // ---------- Slice 17: preview-canvas snapshot ----------
+  const takeSnapshot = async () => {
+    const cv = canvasRef.current
+    if (!cv) return
+    setSnapBusy(true)
+    try {
+      await api.snapshot(projectId, cv.toDataURL('image/png'))
+      await refreshSnapshots()
+      setMediaTab('media')
+    } catch (e: any) { onError(e.message) }
+    finally { setSnapBusy(false) }
+  }
+
+  // ---------- Slice 17: screen recording ----------
+  const screenTimer = useRef<number | null>(null)
+  const toggleScreenRec = async () => {
+    if (screenRec) {
+      try { await api.recordStop(projectId) }
+      catch (e: any) { onError(e.message) }
+      if (screenTimer.current) { window.clearInterval(screenTimer.current); screenTimer.current = null }
+      setScreenRec(null); setScreenElapsed(0)
+      await refreshRecordings()
+      setMediaTab('media')
+      return
+    }
+    try {
+      const { recording } = await api.recordStart(projectId)
+      setScreenRec(recording); setScreenElapsed(0)
+      screenTimer.current = window.setInterval(() => setScreenElapsed((s) => s + 1), 1000)
+    } catch (e: any) { onError(e.message) }
+  }
+  useEffect(() => () => {
+    if (screenTimer.current) window.clearInterval(screenTimer.current)
+  }, [])
 
   // ---------- preview ----------
   const srcUrl = useMemo(() => api.sourceUrl(projectId), [projectId])
@@ -939,6 +1007,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                   posterUrl={posterUrl} usedInTimeline={blocks.length > 0}
                   onImport={onImport} mediaTab={mediaTab} setMediaTab={setMediaTab}
                   audioFiles={audioFiles} titles={titles}
+                  snapshots={snapshots} recordings={recordings}
                   onAddTitle={addTitle} onDeleteTitle={(id) => setTitles((ts) => ts.filter((t) => t.id !== id))}
                   currentTime={currentTime} />
 
@@ -974,6 +1043,9 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                 </button>
                 <button title="Next frame" onClick={() => stepFrame(1)} className="px-2 py-1 card muted text-sm">⏭</button>
                 <button title="Stop" onClick={() => { videoRef.current?.pause(); seek(0) }} className="px-2 py-1 card muted text-sm">⏹</button>
+                {/* Slice 17: snapshot the preview canvas */}
+                <button title="Snapshot preview frame (PNG → media bin)" onClick={takeSnapshot}
+                        disabled={snapBusy} className="px-2 py-1 card muted text-sm disabled:opacity-40">📷</button>
               </div>
               <div className="tabular text-xs faint">{fmtTC(currentTime)} <span className="mx-1">/</span> {fmtTC(editTotal || srcDuration)}</div>
               <button title="Fullscreen" onClick={() => playerWrapRef.current?.requestFullscreen?.()}
@@ -1129,7 +1201,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                   {segments.length === 0 && <div className="muted text-sm">No speech detected.</div>}
                 </div>
               )}
-              {tab === 'voice' && <VoiceStudio projectId={projectId} />}
+              {tab === 'voice' && <VoiceStudio projectId={projectId} onRecorded={refreshAudio} />}
               {tab === 'publish' && (
                 !seoData ? (
                   <div>
@@ -1166,6 +1238,17 @@ export default function Studio({ projectId, fileName, segments, silences, langua
           <button title="Razor — split clip at click (C)" onClick={() => setTool('razor')}
                   className={`px-3 py-1.5 ${tool === 'razor' ? 'btn-primary text-white' : 'muted'}`}>✂</button>
         </div>
+        {/* Slice 17: marker + screen record */}
+        <button title="Add marker at playhead (M)" onClick={addMarker}
+                className="px-2.5 py-1.5 rounded-lg card muted text-sm">⚑</button>
+        <button title={screenRec ? 'Stop screen recording' : 'Start screen recording'}
+                onClick={toggleScreenRec}
+                className="px-2.5 py-1.5 rounded-lg card text-sm flex items-center gap-1.5"
+                style={screenRec ? { color: '#fff', background: 'var(--danger)' } : undefined}>
+          <span className={`w-2.5 h-2.5 rounded-full ${screenRec ? 'animate-pulse' : ''}`}
+                style={{ background: screenRec ? '#fff' : 'var(--danger)' }} />
+          {screenRec ? <span className="tabular">{fmtTime(screenElapsed)}</span> : 'Screen'}
+        </button>
         <span className="faint text-[11px] ml-1 hidden lg:inline">
           {tool === 'razor' ? 'Click a clip to split it' : 'Drag clips to move · drag edges to trim'}
         </span>
@@ -1186,7 +1269,8 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                 onSeek={seek} selectedId={selectedId} onSelect={setSelectedId}
                 tool={tool} pxPerSec={pxPerSec} setPxPerSec={setPxPerSec}
                 trackLocked={trackLocked} onToggleLock={() => setTrackLocked((v) => !v)}
-                audioMuted={audioMuted} onToggleMute={() => setAudioMuted((v) => !v)} />
+                audioMuted={audioMuted} onToggleMute={() => setAudioMuted((v) => !v)}
+                markers={markers} onMarkerDelete={deleteMarker} />
     </div>
   )
 }

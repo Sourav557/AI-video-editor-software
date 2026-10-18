@@ -344,6 +344,8 @@ export function remapPeaksBlocks(peaks: number[], srcDur: number, blocks: Block[
   return out
 }
 
+export interface MarkerT { id: string; t: number; label: string }
+
 let uid = 0
 export const newId = () => `b${Date.now().toString(36)}${uid++}`
 
@@ -369,6 +371,9 @@ interface Props {
   onToggleLock: () => void
   audioMuted: boolean
   onToggleMute: () => void
+  /** Slice 17: timeline markers — flags on the ruler. */
+  markers: MarkerT[]
+  onMarkerDelete: (id: string) => void
 }
 
 export default function Timeline(p: Props) {
@@ -620,6 +625,17 @@ export default function Timeline(p: Props) {
                 <div key={t} className="absolute top-0 bottom-0" style={{ left: t * p.pxPerSec }}>
                   <div className="w-px h-2" style={{ background: 'var(--border)' }} />
                   <div className="faint text-[9px] tabular pl-1">{fmtTime(t)}</div>
+                </div>
+              ))}
+              {/* Slice 17: markers — click to seek, right-click to delete */}
+              {p.markers.map((m) => (
+                <div key={m.id}
+                     className="absolute top-0 h-full flex items-start justify-center z-10"
+                     style={{ left: m.t * p.pxPerSec, transform: 'translateX(-50%)', cursor: 'pointer' }}
+                     title={`${m.label || 'Marker'} · ${fmtTime(m.t)} — click to seek · right-click to delete`}
+                     onClick={(e) => { e.stopPropagation(); p.onSeek(m.t) }}
+                     onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); p.onMarkerDelete(m.id) }}>
+                  <span className="text-[12px] leading-none" style={{ color: 'var(--warning)' }}>⚑</span>
                 </div>
               ))}
             </div>

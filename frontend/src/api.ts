@@ -116,12 +116,43 @@ export const api = {
   projectInfo: (pid: string) => req<any>(`/api/projects/${pid}/info`),
   audioList: (pid: string) => req<{ files: string[] }>(`/api/projects/${pid}/audio`),
   audioUrl: (pid: string, name: string) => `${API_BASE}/api/projects/${pid}/audio/${name}`,
-  timelineGet: (pid: string) => req<{ blocks: any[]; titles: any[] }>(`/api/projects/${pid}/timeline`),
-  timelineSave: (pid: string, blocks: any[], titles: any[]) =>
+  /** Slice 17: upload a mic-recorded voiceover (MediaRecorder output). */
+  audioUpload: (pid: string, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return req<{ file: string; duration?: number }>(`/api/projects/${pid}/audio/upload`, {
+      method: 'POST',
+      body: fd,
+    })
+  },
+  /** Slice 17: screen capture. */
+  recordStart: (pid: string, opts?: { region?: string; fps?: number }) =>
+    req<{ recording: string }>(`/api/projects/${pid}/record/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts ?? {}),
+    }),
+  recordStop: (pid: string) =>
+    req<{ file: string; duration: number; ok: boolean }>(`/api/projects/${pid}/record/stop`, { method: 'POST' }),
+  recordStatus: (pid: string) =>
+    req<{ recording: boolean; file?: string; elapsed?: number }>(`/api/projects/${pid}/record/status`),
+  recordings: (pid: string) => req<{ files: string[] }>(`/api/projects/${pid}/recordings`),
+  recordingUrl: (pid: string, name: string) => `${API_BASE}/api/projects/${pid}/recordings/${name}`,
+  /** Slice 17: preview-canvas snapshot. */
+  snapshot: (pid: string, image: string) =>
+    req<{ file: string }>(`/api/projects/${pid}/snapshot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image }),
+    }),
+  snapshots: (pid: string) => req<{ files: string[] }>(`/api/projects/${pid}/snapshots`),
+  snapshotUrl: (pid: string, name: string) => `${API_BASE}/api/projects/${pid}/snapshots/${name}`,
+  timelineGet: (pid: string) => req<{ blocks: any[]; titles: any[]; markers?: any[] }>(`/api/projects/${pid}/timeline`),
+  timelineSave: (pid: string, blocks: any[], titles: any[], markers?: any[]) =>
     req<{ ok: boolean }>(`/api/projects/${pid}/timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ blocks, titles }),
+      body: JSON.stringify({ blocks, titles, markers: markers ?? [] }),
     }),
   transcript: (pid: string) =>
     req<{ transcript: any; silence: any }>(`/api/projects/${pid}/transcript`),
