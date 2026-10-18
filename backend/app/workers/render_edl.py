@@ -29,6 +29,8 @@ import shutil
 import subprocess
 
 from ..projects import get_video_path, load_json, project_dir, save_json
+from ..project_settings import get_settings
+from . import codecs as _codecs
 from .caption import _esc, _pick_font, _srt_time
 
 
@@ -181,7 +183,7 @@ def _source_has_audio(video) -> bool:
 def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
                  color: list[str] | None = None, reversed_: bool = False,
                  stab_filter: str | None = None, chroma: dict | None = None,
-                 layout: dict | None = None) -> str:
+                 layout: dict | None = None, fps: int = 30) -> str:
     """-vf string for a keyframed block.
 
     Renders the clip on a transparent WxH canvas: per-frame scale / rotate /
@@ -227,7 +229,7 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
         f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='p(X,Y)*({AA})'[fg]",
     ]
     fg = ",".join(fg_parts)
-    bg = f"color=c=black@0:s={W}x{H}:d={dur:.3f}:r=30[bg]"
+    bg = f"color=c=black@0:s={W}x{H}:d={dur:.3f}:r={fps}[bg]"
     ov = (f"[bg][fg]overlay=x={ox}:y={oy}"
           f":eof_action=pass,format=yuv420p")
     return f"{fg};{bg};{ov}"
@@ -722,7 +724,8 @@ def _default_v2_layout(W: int, H: int) -> dict:
     return {"x": W - w - 24, "y": H - h - 24, "w": w, "h": h}
 
 
-def _layout_norm(layout: dict | None, W: int, H: int, norm_tail: str) -> str:
+def _layout_norm(layout: dict | None, W: int, H: int, norm_tail: str,
+                fps: int = 30) -> str:
     """Geometry normalize for a V1 block: fullscreen (norm_tail) or aspect-fit
     into the layout rect, centered, then placed at (x, y) on the WxH canvas."""
     if not layout:
@@ -730,7 +733,7 @@ def _layout_norm(layout: dict | None, W: int, H: int, norm_tail: str) -> str:
     x, y, w, h = layout["x"], layout["y"], layout["w"], layout["h"]
     return (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"pad={W}:{H}:{x}:{y},fps=30,format=yuv420p,settb=AVTB")
+            f"pad={W}:{H}:{x}:{y},fps={fps},format=yuv420p,settb=AVTB")
 
 
 def _clean_edit_start(raw) -> float:
@@ -874,7 +877,8 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
                       duck_af: list[str] | None = None,
                       stab_mode: str = "", trf_path: str | None = None,
                       chroma: dict | None = None,
-                      layout: dict | None = None) -> None:
+                      layout: dict | None = None,
+                      fps: int = 30) -> None:
     """Render one source-span piece of a Slice-14 block.
 
     Same trim/speed/color/normalize/caption chain as the old path, with
@@ -900,12 +904,12 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
         if kf:
             s = _keyframe_vf(kf, W, H, piece_dur, speed, color_vf, reversed_,
                              stab_filter=stab_filter, chroma=chroma,
-                             layout=layout)
+                             layout=layout, fps=fps)
             if sub_f:
                 s += "," + sub_f
             if title_fs:
                 s += "," + ",".join(title_fs)
-            return s + ",fps=30,settb=AVTB"
+            return s + f",fps={fps},settb=AVTB"
         parts = ["reverse"] if reversed_ else []
         parts.append(f"setpts=PTS/{speed}")
         if stab_filter:
@@ -954,7 +958,7 @@ def _render_v2_tile(ffmpeg: str, pid: str, video, lay: dict,
                     chroma: dict | None, color_vf: list[str],
                     stab_mode: str, trf_path: str | None,
                     src_start: float, src_end: float, speed: float,
-                    out_path) -> None:
+                    out_path, fps: int = 30) -> None:
     """Render one V2 overlay tile: trim/speed/color/stabilize/chroma.
 
     No captions, titles, keyframes, ramps, reverse or freeze (documented).
@@ -974,7 +978,7 @@ def _render_v2_tile(ffmpeg: str, pid: str, video, lay: dict,
         if chroma:
             # keep the keyed alpha for the overlay composite
             parts += [_chroma_vf(chroma), "format=rgba"]
-        parts.append("fps=30,settb=AVTB")
+        parts.append(f"fps={fps},settb=AVTB")
         return ",".join(parts)
 
     if stab_mode == "vidstab":
@@ -996,7 +1000,7 @@ def _render_v2_tile(ffmpeg: str, pid: str, video, lay: dict,
 
 def _render_still_piece(ffmpeg: str, frame_png, norm_tail: str, dur: float,
                         audio_params: tuple[int, str], title_fs: list[str],
-                        out_path) -> None:
+                        out_path, fps: int = 30) -> None:
     """Render a freeze-frame still: loop the extracted frame, silent audio.
 
     Silent audio is resampled to _PIPE_AUDIO_RATE with the source's channel
@@ -1005,7 +1009,7 @@ def _render_still_piece(ffmpeg: str, frame_png, norm_tail: str, dur: float,
     rate, layout = audio_params
     vf = norm_tail + ("," + ",".join(title_fs) if title_fs else "")
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-           "-loop", "1", "-framerate", "30", "-t", f"{dur:.3f}",
+           "-loop", "1", "-framerate", str(fps), "-t", f"{dur:.3f}",
            "-i", str(frame_png),
            "-f", "lavfi", "-i", f"anullsrc=r={rate}:cl={layout}:d={dur:.3f}",
            "-vf", vf,
@@ -1126,12 +1130,19 @@ def run(job, report) -> dict:
 
     # Slice 12: all segments must be xfade-compatible — identical WxH,
     # fps, pix_fmt and timebase. Normalize everything to the project canvas.
-    proj_wh = _source_wh(video)
-    W, H = proj_wh
+    # Slice 18: project settings (settings.json) override the canvas size;
+    # when nothing was saved yet, the source WxH + 30fps are followed,
+    # exactly the pre-Slice-18 behavior.
+    settings = get_settings(pid)
+    if settings:
+        W, H, FPS = settings["width"], settings["height"], settings["fps"]
+    else:
+        W, H = _source_wh(video)
+        FPS = 30
     has_audio = _source_has_audio(video)
     norm_tail = (f"scale={W}x{H}:force_original_aspect_ratio=decrease,"
                  f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
-                 f"fps=30,format=yuv420p,settb=AVTB")
+                 f"fps={FPS},format=yuv420p,settb=AVTB")
 
     seg_files: list[str] = []
     seg_durs: list[float] = []
@@ -1200,7 +1211,7 @@ def run(job, report) -> dict:
                     title_fs = _title_filters(
                         pid, _titles_for_block(titles, edit_cursor + piece_offset))
                     _render_still_piece(ffmpeg, frame_png, norm_tail, dur,
-                                        still_audio, title_fs, pf)
+                                        still_audio, title_fs, pf, fps=FPS)
                     piece_offset += dur
                 else:
                     _, s0, s1, v = p
@@ -1223,7 +1234,7 @@ def run(job, report) -> dict:
                                       srt_text, title_fs, pf, pdur,
                                       f"edl_seg_{n}_p{m}", fx_af, p_duck,
                                       stab_mode, str(trf) if trf else None,
-                                      chroma, lay)
+                                      chroma, lay, fps=FPS)
                     piece_offset += pdur
                     if trf:
                         try:
@@ -1270,10 +1281,10 @@ def run(job, report) -> dict:
             def vf_for(stab_filter: str | None) -> str:
                 s = _keyframe_vf(kf, W, H, out_dur, speed, color_vf,
                                  stab_filter=stab_filter, chroma=chroma,
-                                 layout=lay)
+                                 layout=lay, fps=FPS)
                 if cap_filters:
                     s += "," + ",".join(cap_filters)
-                return s + ",fps=30,settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
+                return s + f",fps={FPS},settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
         else:
             # ---- original path + Slice 12 normalization ----
             # Slice 13: color grade sits after setpts and before the
@@ -1281,7 +1292,7 @@ def run(job, report) -> dict:
             # Slice 16: stabilization goes before the geometry normalize
             # (raw frame first), chroma key goes after it (canvas-size
             # frame), layout swaps the fullscreen normalize for a rect fit.
-            norm = _layout_norm(lay, W, H, norm_tail)
+            norm = _layout_norm(lay, W, H, norm_tail, fps=FPS)
 
             def vf_for(stab_filter: str | None) -> str:
                 parts = [f"setpts=PTS/{speed}"]
@@ -1376,7 +1387,7 @@ def run(job, report) -> dict:
         trf = project_dir(pid) / f"edl_v2_{n}.trf"
         _render_v2_tile(ffmpeg, pid, video, lay, chroma, color_vf, stab_mode,
                         str(trf) if stab_mode == "vidstab" else None,
-                        src_start, src_end, speed, tile)
+                        src_start, src_end, speed, tile, fps=FPS)
         try:
             trf.unlink()
         except OSError:
@@ -1414,7 +1425,37 @@ def run(job, report) -> dict:
            "v2_tiles": len(tiles),
            "layouts": sum(1 for x in blocks if x.get("layout"))}
     save_json(pid, "edit_edl.json", edl)
+
+    # ---- Slice 18: codec transcode for the final downloadable file ----
+    # No codec option -> the default path is EXACTLY as before (edit.mp4).
+    # With a codec option, the EDL render above becomes the mezzanine and
+    # the final file is transcoded to edit_<codec>.<ext>.
+    export_spec = _codecs.spec_from_params(params)
+    if export_spec is not None:
+        report(0.95)
+        name = _unique_export_name(pid, export_spec["file"])
+        _codecs.transcode(ffmpeg, out, project_dir(pid) / name, export_spec)
+        report(1.0)
+        return {"file": name, "codec": export_spec["codec"],
+                "crf": export_spec["crf"], "preset": export_spec["preset"],
+                "profile": export_spec["profile"],
+                "blocks": len(blocks), "output_duration": out_dur,
+                "titles": len(titles), "transitions": edl["transitions"],
+                "join_path": join_path}
+
     report(1.0)
     return {"file": out.name, "blocks": len(blocks),
             "output_duration": out_dur, "titles": len(titles),
             "transitions": edl["transitions"], "join_path": join_path}
+
+
+def _unique_export_name(pid: str, base: str) -> str:
+    """edit_hevc.mp4, or edit_hevc_2.mp4 when it already exists."""
+    d = project_dir(pid)
+    if not (d / base).exists():
+        return base
+    stem, ext = base.rsplit(".", 1)
+    i = 2
+    while (d / f"{stem}_{i}.{ext}").exists():
+        i += 1
+    return f"{stem}_{i}.{ext}"

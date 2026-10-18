@@ -16,6 +16,7 @@ import ClipsPanel from './ClipsPanel'
 import VoiceStudio from './VoiceStudio'
 import PublishPrep from './PublishPrep'
 import ChatPanel from './ChatPanel'
+import ProjectSettings from './ProjectSettings'
 
 interface Props {
   projectId: string
@@ -617,6 +618,21 @@ export default function Studio({ projectId, fileName, segments, silences, langua
   const [generatingSeo, setGeneratingSeo] = useState(false)
   /** Slice 16: project canvas W/H (for layout presets / manual geometry). */
   const [projWH, setProjWH] = useState<{ w: number; h: number } | null>(null)
+  /** Slice 18: export codecs catalog + options, batch queue, project settings. */
+  const [codecCatalog, setCodecCatalog] = useState<Record<string, any>>({})
+  const [showExp, setShowExp] = useState(false)
+  const [expCodec, setExpCodec] = useState('h264')
+  const [expCrf, setExpCrf] = useState<number | null>(null)
+  const [expPreset, setExpPreset] = useState('veryfast')
+  const [expProfile, setExpProfile] = useState(2)
+  const [renderFile, setRenderFile] = useState<string | null>(null)
+  const [batchItems, setBatchItems] = useState<{ codec: string; crf?: number; preset?: string; profile?: number }[]>([])
+  const [batchRunning, setBatchRunning] = useState(false)
+  const [batchProgress, setBatchProgress] = useState(0)
+  const [batchNote, setBatchNote] = useState('')
+  const [batchResults, setBatchResults] = useState<{ file: string; codec: string; size: number }[]>([])
+  const [showSettings, setShowSettings] = useState(false)
+  const [projAspect, setProjAspect] = useState<string | null>(null)
 
   // ---------- load ----------
   /** Slice 17: refresh helpers for media-bin extras + audio list. */
@@ -634,6 +650,8 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     refreshSnapshots()
     refreshRecordings()
     api.luts().then((r) => setLuts(r.luts ?? [])).catch(() => {})
+    api.exportCodecs().then((r) => setCodecCatalog(r.codecs ?? {})).catch(() => {})
+    api.settingsGet(projectId).then((s) => setProjAspect(s.aspect)).catch(() => {})
     api.projectInfo(projectId)
       .then((i: any) => { if (i?.width && i?.height) setProjWH({ w: i.width, h: i.height }) })
       .catch(() => {})
@@ -653,6 +671,13 @@ export default function Studio({ projectId, fileName, segments, silences, langua
       .catch(() => { seedFromAutopilot(); loadedTl.current = true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId])
+
+  // Slice 18: File → Project settings… (MenuBar dispatches this event).
+  useEffect(() => {
+    const open = () => setShowSettings(true)
+    window.addEventListener('open-project-settings', open)
+    return () => window.removeEventListener('open-project-settings', open)
+  }, [])
 
   const seedFromAutopilot = () => {
     api.autopilotGet(projectId)
@@ -882,12 +907,13 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     } catch (e: any) { setApRunning(false); onError(e.message) }
   }
 
-  const renderEdit = async () => {
+  // Slice 18: opts = {codec, crf, preset, profile}; omitted = default h264 path.
+  const renderEdit = async (opts?: { codec?: string; crf?: number; preset?: string; profile?: number }) => {
     if (!blocks.length) return
-    setRenderRunning(true); setRenderProgress(0)
+    setRenderRunning(true); setRenderProgress(0); setRenderFile(null); setShowExp(false)
     try {
       const payload = blocks.map((b) => ({ ...b, muted: b.muted || audioMuted }))
-      const { render_job } = await api.editRender(projectId, payload, optCaptions, titles)
+      const { render_job } = await api.editRender(projectId, payload, optCaptions, titles, opts)
       const iv = window.setInterval(async () => {
         try {
           const j: JobStatus = await api.job(render_job)
@@ -897,10 +923,51 @@ export default function Studio({ projectId, fileName, segments, silences, langua
             setRenderRunning(false)
             if (j.status === 'failed') { onError(`Render failed: ${j.error}`); return }
             setHasRender(true); setView('rendered')
+            if (j.result?.file) setRenderFile(j.result.file)
           }
         } catch (e: any) { window.clearInterval(iv); setRenderRunning(false); onError(e.message) }
       }, 1500)
     } catch (e: any) { setRenderRunning(false); onError(e.message) }
+  }
+
+  // Slice 18: batch export — queue the current options, then export all in one job.
+  const expMeta = codecCatalog[expCodec] ?? {}
+  const batchAdd = () => {
+    if (batchItems.length >= 8) { onError('Batch is full (max 8 items)'); return }
+    const item: { codec: string; crf?: number; preset?: string; profile?: number } = { codec: expCodec }
+    if (expMeta.crf_range) item.crf = expCrf ?? expMeta.crf_default
+    if (expMeta.presets) item.preset = expPreset
+    if (expMeta.profiles) item.profile = expProfile
+    setBatchItems((b) => [...b, item])
+  }
+
+  const runBatch = async () => {
+    if (!blocks.length || !batchItems.length) return
+    setBatchRunning(true); setBatchProgress(0); setBatchNote(''); setBatchResults([])
+    try {
+      const payload = blocks.map((b) => ({ ...b, muted: b.muted || audioMuted }))
+      const { batch_job } = await api.editBatch(projectId, payload, optCaptions, titles, batchItems)
+      const iv = window.setInterval(async () => {
+        try {
+          const j: JobStatus = await api.job(batch_job)
+          setBatchProgress(j.progress)
+          if (j.note) {
+            try {
+              const n = JSON.parse(j.note)
+              setBatchNote(n.state === 'done'
+                ? `✓ ${n.item}/${n.of} · ${n.codec} → ${n.file}`
+                : `… ${n.item}/${n.of} · ${n.codec} → ${n.file}`)
+            } catch { setBatchNote(j.note) }
+          }
+          if (j.status === 'done' || j.status === 'failed') {
+            window.clearInterval(iv)
+            setBatchRunning(false)
+            if (j.status === 'failed') { onError(`Batch failed: ${j.error}`); return }
+            setBatchResults(j.result?.items ?? [])
+          }
+        } catch (e: any) { window.clearInterval(iv); setBatchRunning(false); onError(e.message) }
+      }, 1500)
+    } catch (e: any) { setBatchRunning(false); onError(e.message) }
   }
 
   const doSeo = async () => {
@@ -941,6 +1008,10 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     { id: 'chat', label: '💬 Co-editor' },
   ]
 
+  // Slice 18: the preview canvas follows the project aspect setting
+  // ('custom' or unset falls back to the loaded video's own aspect).
+  const projAspectCss = projAspect && projAspect !== 'custom'
+    ? projAspect.replace(':', ' / ') : null
   return (
     <div className="space-y-4">
       {/* ======= top toolbar ======= */}
@@ -981,11 +1052,89 @@ export default function Studio({ projectId, fileName, segments, silences, langua
               </div>
             )}
           </div>
-          <button className="px-4 py-2 rounded-lg text-sm font-semibold text-white"
-                  style={{ background: 'linear-gradient(135deg,#22c55e,#16a34a)' }}
-                  disabled={renderRunning || !blocks.length} onClick={renderEdit}>
-            {renderRunning ? `Export… ${Math.round(renderProgress * 100)}%` : '⬆ Export'}
-          </button>
+          {/* Slice 18: split export button — quick default export + codec/quality options. */}
+          <div className="relative">
+            <div className="flex rounded-lg overflow-hidden">
+              <button className="px-4 py-2 text-sm font-semibold text-white"
+                      style={{ background: 'linear-gradient(135deg,#22c55e,#16a34a)' }}
+                      disabled={renderRunning || !blocks.length} onClick={() => renderEdit()}>
+                {renderRunning ? `Export… ${Math.round(renderProgress * 100)}%` : '⬆ Export'}
+              </button>
+              <button title="Export options: codec, quality, batch" onClick={() => setShowExp((s) => !s)}
+                      disabled={renderRunning}
+                      className="px-2.5 py-2 text-sm text-white disabled:opacity-40"
+                      style={{ background: '#15803d' }}>⚙</button>
+            </div>
+            {showExp && !renderRunning && (
+              <div className="absolute right-0 mt-2 w-72 card p-4 z-20 space-y-2.5 text-sm"
+                   style={{ background: 'var(--surface-2)' }}>
+                <div className="font-semibold">Export options</div>
+                <label className="block">
+                  <span className="faint text-xs">Codec</span>
+                  <select value={expCodec} onChange={(e) => {
+                      const c = e.target.value
+                      setExpCodec(c)
+                      const m = codecCatalog[c] ?? {}
+                      setExpCrf(null); setExpPreset(m.preset_default ?? 'veryfast')
+                    }}
+                    className="mt-1 w-full px-2 py-1.5 rounded-lg card text-sm text-white">
+                    {Object.entries(codecCatalog).map(([k, m]: any) => (
+                      <option key={k} value={k}>{m.label}</option>
+                    ))}
+                  </select>
+                </label>
+                {expMeta.crf_range && (
+                  <label className="block">
+                    <span className="faint text-xs">
+                      Quality (CRF {expMeta.crf_range[0]}–{expMeta.crf_range[1]}):{' '}
+                      <b className="text-white">{expCrf ?? expMeta.crf_default}</b>{' '}
+                      <span className="faint">(lower = better)</span>
+                    </span>
+                    <input type="range" min={expMeta.crf_range[0]} max={expMeta.crf_range[1]}
+                           value={expCrf ?? expMeta.crf_default}
+                           onChange={(e) => setExpCrf(Number(e.target.value))} className="w-full" />
+                  </label>
+                )}
+                {expMeta.presets && (
+                  <label className="block">
+                    <span className="faint text-xs">Preset (speed ↔ quality)</span>
+                    <select value={expPreset} onChange={(e) => setExpPreset(e.target.value)}
+                            className="mt-1 w-full px-2 py-1.5 rounded-lg card text-sm text-white">
+                      {expMeta.presets.map((p: string) => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                  </label>
+                )}
+                {expMeta.profiles && (
+                  <label className="block">
+                    <span className="faint text-xs">ProRes profile</span>
+                    <select value={expProfile} onChange={(e) => setExpProfile(Number(e.target.value))}
+                            className="mt-1 w-full px-2 py-1.5 rounded-lg card text-sm text-white">
+                      {['Proxy', 'LT', 'Standard', 'HQ'].map((l, i) => (
+                        <option key={i} value={i}>{l}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {expCodec === 'gif' && (
+                  <p className="muted text-[11px]">GIF is capped at 480px wide / 15fps for sanity.</p>
+                )}
+                {expMeta.audio_only && (
+                  <p className="muted text-[11px]">Audio only — no video track.</p>
+                )}
+                <div className="flex gap-2 pt-1">
+                  <button className="flex-1 px-3 py-2 rounded-lg text-sm card"
+                          onClick={batchAdd}>＋ Add to batch</button>
+                  <button className="flex-1 px-3 py-2 rounded-lg text-sm font-semibold text-white"
+                          style={{ background: 'linear-gradient(135deg,#22c55e,#16a34a)' }}
+                          onClick={() => renderEdit({ codec: expCodec,
+                                                     crf: expCrf ?? undefined,
+                                                     preset: expPreset, profile: expProfile })}>
+                    Export
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
       {(apRunning || renderRunning) && (
@@ -998,6 +1147,80 @@ export default function Studio({ projectId, fileName, segments, silences, langua
             {apRunning ? `Autopilot is editing your video… ${Math.round(apProgress * 100)}%`
                        : `Rendering your timeline… ${Math.round(renderProgress * 100)}%`}
           </div>
+        </div>
+      )}
+
+      {/* Slice 18: single-export download link */}
+      {renderFile && !renderRunning && (
+        <div className="card px-4 py-2 flex items-center gap-3 text-sm">
+          <span style={{ color: 'var(--success)' }}>✓ Export ready: {renderFile}</span>
+          <a className="underline" href={api.editExportFileUrl(projectId, renderFile)}
+             download={renderFile}>⬇ Download</a>
+          <button className="muted text-xs ml-auto" onClick={() => setRenderFile(null)}>✕</button>
+        </div>
+      )}
+
+      {/* Slice 18: batch export queue */}
+      {(batchItems.length > 0 || batchRunning || batchResults.length > 0) && (
+        <div className="card px-4 py-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-sm">📦 Batch export</span>
+            <span className="faint text-xs">
+              {batchItems.length} item{batchItems.length === 1 ? '' : 's'} · renders the timeline once
+            </span>
+            <div className="ml-auto flex gap-2">
+              <button className="px-3 py-1.5 rounded-lg text-xs card" disabled={batchRunning}
+                      onClick={() => { setBatchItems([]); setBatchResults([]); setBatchNote('') }}>
+                Clear
+              </button>
+              <button className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white disabled:opacity-40"
+                      style={{ background: 'linear-gradient(135deg,#22c55e,#16a34a)' }}
+                      disabled={batchRunning || !batchItems.length || !blocks.length} onClick={runBatch}>
+                {batchRunning ? `Exporting… ${Math.round(batchProgress * 100)}%`
+                              : `Export all (${batchItems.length})`}
+              </button>
+            </div>
+          </div>
+          {batchItems.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {batchItems.map((it, i) => (
+                <span key={i} className="px-2.5 py-1 rounded-full text-xs card flex items-center gap-2">
+                  {codecCatalog[it.codec]?.label ?? it.codec}
+                  {it.crf != null && <span className="faint">crf {it.crf}</span>}
+                  {it.preset && <span className="faint">{it.preset}</span>}
+                  {it.profile != null && codecCatalog[it.codec]?.profiles && (
+                    <span className="faint">{['Proxy', 'LT', 'Standard', 'HQ'][it.profile]}</span>
+                  )}
+                  {!batchRunning && (
+                    <button className="muted hover:text-white"
+                            onClick={() => setBatchItems((b) => b.filter((_, j) => j !== i))}>✕</button>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+          {batchRunning && (
+            <div>
+              <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--surface-2)' }}>
+                <div className="h-full rounded-full transition-all"
+                     style={{ width: `${batchProgress * 100}%`, background: 'var(--ai-gradient)' }} />
+              </div>
+              {batchNote && <div className="muted text-xs mt-1.5">{batchNote}</div>}
+            </div>
+          )}
+          {batchResults.length > 0 && !batchRunning && (
+            <div className="space-y-1">
+              {batchResults.map((r) => (
+                <div key={r.file} className="flex items-center gap-3 text-sm">
+                  <span style={{ color: 'var(--success)' }}>✓</span>
+                  <span>{r.file}</span>
+                  <span className="faint text-xs">{r.codec} · {(r.size / 1e6).toFixed(1)} MB</span>
+                  <a className="underline ml-auto" href={api.editExportFileUrl(projectId, r.file)}
+                     download={r.file}>⬇ Download</a>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1027,7 +1250,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                      if (v?.videoWidth) setVidAspect(`${v.videoWidth} / ${v.videoHeight}`)
                    }} />
             <canvas ref={canvasRef} className="block"
-                    style={{ aspectRatio: vidAspect, maxHeight: '46vh', maxWidth: '100%', background: '#000' }} />
+                    style={{ aspectRatio: projAspectCss ?? vidAspect, maxHeight: '46vh', maxWidth: '100%', background: '#000' }} />
           </div>
           {/* transport */}
           <div className="mt-2">
@@ -1271,6 +1494,11 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                 trackLocked={trackLocked} onToggleLock={() => setTrackLocked((v) => !v)}
                 audioMuted={audioMuted} onToggleMute={() => setAudioMuted((v) => !v)}
                 markers={markers} onMarkerDelete={deleteMarker} />
+
+      {/* Slice 18: project settings dialog (File menu or this Studio only). */}
+      <ProjectSettings projectId={projectId} open={showSettings}
+                       onClose={() => setShowSettings(false)}
+                       onSaved={(s) => setProjAspect(s.aspect)} />
     </div>
   )
 }

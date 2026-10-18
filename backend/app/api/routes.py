@@ -14,8 +14,10 @@ from fastapi.responses import FileResponse
 
 from ..orchestrator.queue import orchestrator
 from ..platforms import PRESET_VERSION, PRESETS
+from ..project_settings import get_settings_or_defaults, save_settings
 from ..projects import (get_video_path, load_json, new_project, project_dir,
                         project_exists, save_json, save_upload)
+from ..workers import codecs as _codecs
 from ..workers.tts import LANGUAGES, SPEAKERS
 
 router = APIRouter(prefix="/api")
@@ -70,7 +72,7 @@ def job_status(job_id: str):
         raise HTTPException(404, "job not found")
     return {"id": j.id, "kind": j.kind, "status": j.status,
             "progress": round(j.progress, 3), "error": j.error,
-            "result": j.result}
+            "note": j.note or "", "result": j.result}
 
 
 @router.get("/projects/{pid}/transcript")
@@ -363,7 +365,10 @@ def autopilot_file(pid: str):
 
 @router.post("/projects/{pid}/edit/render")
 def edit_render(pid: str, body: dict):
-    """Render an explicit block list from the timeline editor."""
+    """Render an explicit block list from the timeline editor.
+
+    Optional Slice-18 codec options: {"codec", "crf", "preset", "profile"}.
+    Without them the default h264 path runs exactly as before."""
     if not project_exists(pid):
         raise HTTPException(404, "project not found")
     blocks = body.get("blocks") or []
@@ -373,8 +378,115 @@ def edit_render(pid: str, body: dict):
         "blocks": blocks,
         "captions": body.get("captions", True),
         "titles": body.get("titles") or [],
+        **_export_opts_or_400(body),
     })
     return {"render_job": job.id}
+
+
+def _export_opts_or_400(body: dict) -> dict:
+    """Sanitize optional codec options for /edit/render; {} when absent.
+
+    Unknown codecs and unavailable encoders (e.g. AV1 on a slim ffmpeg
+    build) become clean 400s here so the job never starts doomed."""
+    if not any(k in body for k in ("codec", "crf", "preset", "profile")):
+        return {}
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(500, "ffmpeg not found on PATH")
+    try:
+        spec = _codecs.clean_export_spec(body.get("codec", "h264"),
+                                         body.get("crf"), body.get("preset"),
+                                         body.get("profile"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    ok, msg = _codecs.availability(ffmpeg, spec["codec"])
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"codec": spec["codec"], "crf": spec["crf"],
+            "preset": spec["preset"], "profile": spec["profile"]}
+
+
+@router.post("/projects/{pid}/edit/batch")
+def edit_batch(pid: str, body: dict):
+    """Queue a batch export: render the timeline ONCE, then transcode one
+    file per item. Body: {blocks, captions?, titles?, items: [{codec, crf?, preset?, profile?}]}."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    blocks = body.get("blocks") or []
+    if not blocks:
+        raise HTTPException(400, "empty timeline")
+    items = body.get("items")
+    if not items or not isinstance(items, list):
+        raise HTTPException(400, "items must be a non-empty list")
+    if len(items) > 8:
+        raise HTTPException(400, "max 8 batch items per job")
+    # Validate every codec + encoder availability up front (fail fast).
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(500, "ffmpeg not found on PATH")
+    for it in items:
+        if not isinstance(it, dict):
+            raise HTTPException(400, "each batch item must be an object")
+        try:
+            spec = _codecs.clean_export_spec(it.get("codec", "h264"),
+                                             it.get("crf"), it.get("preset"),
+                                             it.get("profile"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        ok, msg = _codecs.availability(ffmpeg, spec["codec"])
+        if not ok:
+            raise HTTPException(400, msg)
+    job = orchestrator.submit("batch_export", pid, priority=15, params={
+        "blocks": blocks,
+        "captions": body.get("captions", True),
+        "titles": body.get("titles") or [],
+        "items": items,
+    })
+    return {"batch_job": job.id, "count": len(items)}
+
+
+_EXPORT_FILE_EXTS = {".mp4": "video/mp4", ".mov": "video/quicktime",
+                     ".webm": "video/webm", ".gif": "image/gif",
+                     ".mp3": "audio/mpeg", ".wav": "audio/wav"}
+
+
+@router.get("/projects/{pid}/edit/files/{filename}")
+def edit_export_file(pid: str, filename: str):
+    """Download a codec/batch export (edit_hevc.mp4, edit.webm, edit.gif, edit.mp3…)."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    if (not filename.startswith("edit_") or "/" in filename or "\\" in filename
+            or ".." in filename):
+        raise HTTPException(400, "invalid filename")
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in _EXPORT_FILE_EXTS:
+        raise HTTPException(400, "invalid filename")
+    path = project_dir(pid) / filename
+    if not path.exists():
+        raise HTTPException(404, "export not ready yet")
+    return FileResponse(path, media_type=_EXPORT_FILE_EXTS[ext], filename=filename)
+
+
+@router.get("/export/codecs")
+def export_codecs():
+    """Slice 18: codec catalog for the export UI (labels, CRF ranges, presets)."""
+    return {"codecs": _codecs.describe()}
+
+
+@router.get("/projects/{pid}/settings")
+def settings_get(pid: str):
+    """Project settings (canvas + fps) for the UI; defaults when unsaved."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    return get_settings_or_defaults(pid)
+
+
+@router.post("/projects/{pid}/settings")
+def settings_save(pid: str, body: dict):
+    """Save project settings. Body: {aspect?, width?, height?, fps?}."""
+    if not project_exists(pid):
+        raise HTTPException(404, "project not found")
+    return save_settings(pid, body)
 
 
 @router.get("/projects/{pid}/edit")

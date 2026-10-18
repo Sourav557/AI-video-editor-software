@@ -23,6 +23,8 @@ export interface JobStatus {
   status: 'queued' | 'running' | 'done' | 'failed'
   progress: number
   error: string | null
+  /** Slice 18: free-text mid-run status (batch per-item progress). */
+  note?: string
   result: any
 }
 
@@ -104,11 +106,33 @@ export const api = {
   sourceUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/source/file`,
   autopilotUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/autopilot/file`,
   editFileUrl: (pid: string) => `${API_BASE}/api/projects/${pid}/edit/file`,
-  editRender: (pid: string, blocks: any[], captions: boolean, titles: any[]) =>
+  editRender: (pid: string, blocks: any[], captions: boolean, titles: any[],
+    opts?: { codec?: string; crf?: number; preset?: string; profile?: number }) =>
     req<{ render_job: string }>(`/api/projects/${pid}/edit/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ blocks, captions, titles }),
+      body: JSON.stringify({ blocks, captions, titles, ...(opts ?? {}) }),
+    }),
+  /** Slice 18: one job, render once, transcode per item. */
+  editBatch: (pid: string, blocks: any[], captions: boolean, titles: any[],
+    items: { codec: string; crf?: number; preset?: string; profile?: number }[]) =>
+    req<{ batch_job: string; count: number }>(`/api/projects/${pid}/edit/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocks, captions, titles, items }),
+    }),
+  /** Slice 18: download URL for a codec/batch export file (edit_hevc.mp4, edit.webm…). */
+  editExportFileUrl: (pid: string, filename: string) =>
+    `${API_BASE}/api/projects/${pid}/edit/files/${encodeURIComponent(filename)}`,
+  /** Slice 18: codec catalog (labels, CRF ranges, presets) for the export UI. */
+  exportCodecs: () => req<{ codecs: Record<string, any> }>('/api/export/codecs'),
+  /** Slice 18: project settings (canvas + fps). */
+  settingsGet: (pid: string) => req<{ aspect: string; width: number; height: number; fps: number }>(`/api/projects/${pid}/settings`),
+  settingsSave: (pid: string, s: { aspect?: string; width?: number; height?: number; fps?: number }) =>
+    req<{ aspect: string; width: number; height: number; fps: number }>(`/api/projects/${pid}/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(s),
     }),
   editGet: (pid: string) => req<any>(`/api/projects/${pid}/edit`),
   filmstrip: (pid: string) => req<{ interval: number; thumbs: string[]; width: number; height: number }>(`/api/projects/${pid}/filmstrip`),

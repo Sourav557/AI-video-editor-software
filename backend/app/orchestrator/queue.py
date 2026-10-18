@@ -27,6 +27,9 @@ class Job:
     params: dict = field(default_factory=dict)
     status: str = QUEUED
     progress: float = 0.0
+    # Slice 18: free-text status line a worker can update mid-run
+    # (e.g. batch_export's per-item progress); surfaced via /api/jobs.
+    note: str = ""
     result: dict | None = None
     error: str | None = None
     created_at: float = field(default_factory=time.time)

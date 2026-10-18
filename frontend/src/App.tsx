@@ -86,6 +86,7 @@ export default function App() {
       <MenuBar menus={[
         { label: 'File', items: [
           { label: 'Import media…', action: () => document.getElementById('file-input')?.click() },
+          { label: 'Project settings…', action: () => window.dispatchEvent(new CustomEvent('open-project-settings')) },
           { label: 'New project', hint: 'Ctrl+N', action: () => window.location.reload() },
         ]},
         { label: 'Edit', items: [
