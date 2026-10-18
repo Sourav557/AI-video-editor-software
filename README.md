@@ -58,6 +58,7 @@ User / UI ──▶ conversational agent (later) ──▶ ORCHESTRATOR (job DAG
 - [x] Slice 13 — color panel (exposure/contrast/saturation/temperature/vignette + LUTs)
 - [x] Slice 14 — speed ramping (piecewise-constant), reverse playback, freeze frame
 - [x] Slice 15 — audio FX (parametric EQ, FFT denoise, volume-automation ducking)
+- [x] Slice 16 — chroma key (green-screen removal), video stabilization (vidstab two-pass / deshake fallback), split screen (V2 overlay track, canvas layouts, editStart)
 - [ ] Slice 4 — Qwen3-TTS voiceover + type-to-fix
 - [ ] Slice 5 — SEO/packaging engine (keywords, titles, descriptions, thumbnails)
 - [ ] Slice 6 — editing agent + style profiles

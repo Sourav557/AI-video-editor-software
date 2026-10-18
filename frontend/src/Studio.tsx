@@ -7,6 +7,8 @@ import Timeline, {
   BlockColor, COLOR_DEFAULTS, COLOR_RANGES, COLOR_PRESETS,
   SpeedRamp, rampSpans, blockOutToSrc,
   EqBand, AudioRole, DuckingConfig, EQ_RANGES, DUCKING_DEFAULTS,
+  ChromaKey, CHROMA_DEFAULTS, BlockTrack, BlockLayout,
+  LAYOUT_PRESET_NAMES, layoutPreset, v1BlocksOf, blockV2Dur,
 } from './Timeline'
 import MediaBin, { MediaTab, TitleT } from './MediaBin'
 import ProjectInfo from './ProjectInfo'
@@ -428,6 +430,141 @@ function AudioFXPanel({ block, onChange, onCommit }: {
   )
 }
 
+/** Slice 16: chroma key + stabilization + split-screen (track/layout) panel
+ *  for the selected clip. Layouts are PIXELS on the project canvas (W×H);
+ *  presets need projWH — manual x/y/w/h works without it. */
+function VideoFXPanel({ block, projWH, onChange, onCommit }: {
+  block: Block
+  projWH: { w: number; h: number } | null
+  onChange: (patch: Partial<Block>, transient?: boolean) => void
+  onCommit: () => void
+}) {
+  const chroma = block.chroma
+  const setChroma = (patch: Partial<ChromaKey>) =>
+    onChange({ chroma: { ...CHROMA_DEFAULTS, ...chroma, ...patch } }, true)
+  const track = (block.track === 'v2' ? 'v2' : 'v1') as BlockTrack
+  const lay = block.layout
+  const setLayout = (patch: Partial<BlockLayout>) => {
+    const W = projWH?.w ?? 1920, H = projWH?.h ?? 1080
+    const cur: BlockLayout = lay ?? { x: 0, y: 0, w: W, h: H }
+    const next = { ...cur, ...patch }
+    next.w = Math.min(Math.max(Math.round(next.w), 16), W)
+    next.h = Math.min(Math.max(Math.round(next.h), 16), H)
+    next.x = Math.min(Math.max(Math.round(next.x), 0), W - next.w)
+    next.y = Math.min(Math.max(Math.round(next.y), 0), H - next.h)
+    onChange({ layout: next }, true)
+  }
+  const num = (label: string, key: keyof BlockLayout, max: number) => (
+    <label className="flex items-center gap-1 text-[11px]">
+      <span className="faint w-4">{label}</span>
+      <input type="number" min={0} max={max} step={1}
+             value={Math.round(lay?.[key] ?? (key === 'w' ? projWH?.w ?? 0 : key === 'h' ? projWH?.h ?? 0 : 0))}
+             onChange={(e) => setLayout({ [key]: Number(e.target.value) })}
+             onBlur={onCommit}
+             className="card px-1.5 py-1 text-[11px] w-16 tabular" />
+    </label>
+  )
+  return (
+    <div className="mt-3 pt-3 border-t space-y-3" style={{ borderColor: 'var(--border)' }}>
+      <div className="font-semibold text-xs" style={{ color: 'var(--cyan)' }}>VIDEO FX</div>
+
+      {/* chroma key */}
+      <div className="text-xs">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={!!chroma}
+                 onChange={(e) => onChange({ chroma: e.target.checked ? { ...CHROMA_DEFAULTS } : undefined })} />
+          <span className="font-medium">🟩 Chroma key</span>
+        </label>
+        {chroma && (
+          <div className="mt-1.5 space-y-1.5 pl-1">
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 faint">Key color</span>
+              <input type="color" value={`#${(chroma.color ?? '00FF00').toLowerCase()}`}
+                     onChange={(e) => setChroma({ color: e.target.value.slice(1).toUpperCase() })}
+                     onBlur={onCommit} className="w-10 h-7 p-0.5 card" />
+              <span className="tabular faint text-[11px]">#{chroma.color}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 faint">Similarity</span>
+              <input type="range" min={0.01} max={0.5} step={0.01}
+                     value={chroma.similarity ?? CHROMA_DEFAULTS.similarity} className="flex-1"
+                     onChange={(e) => setChroma({ similarity: Number(e.target.value) })}
+                     onPointerUp={onCommit} onBlur={onCommit} />
+              <span className="tabular w-10 text-right">{(chroma.similarity ?? 0.15).toFixed(2)}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 faint">Blend</span>
+              <input type="range" min={0} max={0.2} step={0.01}
+                     value={chroma.blend ?? CHROMA_DEFAULTS.blend} className="flex-1"
+                     onChange={(e) => setChroma({ blend: Number(e.target.value) })}
+                     onPointerUp={onCommit} onBlur={onCommit} />
+              <span className="tabular w-10 text-right">{(chroma.blend ?? 0.05).toFixed(2)}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* stabilization */}
+      <label className="flex items-start gap-2 text-xs">
+        <input type="checkbox" checked={!!block.stabilize} className="mt-0.5"
+               onChange={(e) => onChange({ stabilize: e.target.checked || undefined })} />
+        <span>
+          <span className="font-medium">🎥 Stabilize</span>
+          <span className="faint block text-[11px]">Two-pass vidstab — about 2× render time for this clip.</span>
+        </span>
+      </label>
+
+      {/* split screen */}
+      <div className="text-xs">
+        <div className="font-medium mb-1.5">⧉ Split screen</div>
+        <div className="flex rounded-lg overflow-hidden border w-max" style={{ borderColor: 'var(--border)' }}>
+          {(['v1', 'v2'] as BlockTrack[]).map((t) => (
+            <button key={t} onClick={() => onChange({ track: t === 'v1' ? undefined : 'v2' })}
+                    title={t === 'v1' ? 'Main timeline' : 'Overlay tile composited over V1 (video-only)'}
+                    className={`px-2.5 py-1 ${track === t ? 'btn-primary text-white' : 'muted'}`}>
+              {t === 'v1' ? 'V1 main' : 'V2 overlay'}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-2">
+          {LAYOUT_PRESET_NAMES.map((p) => (
+            <button key={p.id}
+                    disabled={!projWH}
+                    title={projWH ? `Place this clip: ${p.label}` : 'Loading project resolution…'}
+                    onClick={() => projWH && onChange({ layout: layoutPreset(p.id, projWH.w, projWH.h) })}
+                    className="text-[11px] px-2 py-1 rounded card hover:text-white disabled:opacity-40">
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2 mt-2 flex-wrap">
+          {num('X', 'x', projWH?.w ?? 9999)}
+          {num('Y', 'y', projWH?.h ?? 9999)}
+          {num('W', 'w', projWH?.w ?? 9999)}
+          {num('H', 'h', projWH?.h ?? 9999)}
+          <span className="faint text-[10px]">px{projWH ? ` of ${projWH.w}×${projWH.h}` : ''}</span>
+        </div>
+        {track === 'v2' && (
+          <div className="flex items-center gap-2 mt-2">
+            <span className="faint text-[11px] w-24 shrink-0">Appears at</span>
+            <input type="number" min={0} step={0.5}
+                   value={block.editStart ?? 0}
+                   onChange={(e) => onChange({ editStart: Math.max(0, Number(e.target.value)) }, true)}
+                   onBlur={onCommit}
+                   className="card px-1.5 py-1 text-[11px] w-20 tabular" />
+            <span className="faint text-[11px]">s (edit time)</span>
+          </div>
+        )}
+        {track === 'v2' && (
+          <div className="faint text-[10px] mt-1">
+            V2 tiles are video-only (audio dropped) and preview on the V2 track — render to see the composite.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export default function Studio({ projectId, fileName, segments, silences, language, srcDuration, onError, onImport }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -469,6 +606,8 @@ export default function Studio({ projectId, fileName, segments, silences, langua
   const [luts, setLuts] = useState<string[]>([])
   const [seoData, setSeoData] = useState<any>(null)
   const [generatingSeo, setGeneratingSeo] = useState(false)
+  /** Slice 16: project canvas W/H (for layout presets / manual geometry). */
+  const [projWH, setProjWH] = useState<{ w: number; h: number } | null>(null)
 
   // ---------- load ----------
   useEffect(() => {
@@ -476,6 +615,9 @@ export default function Studio({ projectId, fileName, segments, silences, langua
     api.filmstrip(projectId).then(setFilmstrip).catch(() => {})
     api.audioList(projectId).then((a) => setAudioFiles(a.files ?? [])).catch(() => {})
     api.luts().then((r) => setLuts(r.luts ?? [])).catch(() => {})
+    api.projectInfo(projectId)
+      .then((i: any) => { if (i?.width && i?.height) setProjWH({ w: i.width, h: i.height }) })
+      .catch(() => {})
     api.editGet(projectId).then(() => setHasRender(true)).catch(() => {})
     // restore saved timeline, else seed
     api.timelineGet(projectId)
@@ -710,14 +852,17 @@ export default function Studio({ projectId, fileName, segments, silences, langua
 
   const selected = blocks.find((b) => b.id === selectedId) ?? null
   const selectedTitle = titles.find((t) => t.id === selectedTitleId) ?? null
-  const { starts: blockStarts, total: editTotal } = layoutBlocks(blocks)
+  // Slice 16: the edit layout/preview is the V1 sequence; V2 tiles overlay it.
+  const v1blocks = useMemo(() => v1BlocksOf(blocks), [blocks])
+  const v1Index = (id: string) => v1blocks.findIndex((b) => b.id === id)
+  const { starts: blockStarts, total: editTotal } = layoutBlocks(v1blocks)
   const updateSelected = (patch: Partial<Block>, transient = false) => {
     if (!selected) return
     commit(blocks.map((b) => (b.id === selected.id ? { ...b, ...patch } : b)), transient)
   }
   // latest blocks/layout/view for the canvas preview loop (avoids effect churn)
-  const kfLive = useRef({ blocks, starts: blockStarts, view })
-  useEffect(() => { kfLive.current = { blocks, starts: blockStarts, view } }, [blocks, blockStarts, view])
+  const kfLive = useRef({ blocks: v1blocks, starts: blockStarts, view })
+  useEffect(() => { kfLive.current = { blocks: v1blocks, starts: blockStarts, view } }, [v1blocks, blockStarts, view])
   const posterUrl = filmstrip?.thumbs.length ? api.filmstripUrl(projectId, filmstrip.thumbs[0]) : null
 
   const tabs: { id: Tab; label: string }[] = [
@@ -861,7 +1006,9 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                     <div className="grid grid-cols-2 gap-2 text-xs">
                       <div><span className="faint">In</span><div className="tabular">{fmtTime(selected.srcStart)}</div></div>
                       <div><span className="faint">Out</span><div className="tabular">{fmtTime(selected.srcEnd)}</div></div>
-                      <div><span className="faint">Duration</span><div className="tabular">{blockDur(selected).toFixed(1)}s</div></div>
+                      <div><span className="faint">Duration</span><div className="tabular">{
+                        (selected.track === 'v2' ? blockV2Dur(selected) : blockDur(selected)).toFixed(1)
+                      }s</div></div>
                       <div>
                         <span className="faint">Speed</span>
                         <div className="flex items-center gap-1">
@@ -882,7 +1029,7 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                     <TimeFXPanel
                       key={selected.id}
                       block={selected}
-                      localOut={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}
+                      localOut={currentTime - (blockStarts[v1Index(selected.id)] ?? 0)}
                       onChange={(patch) => updateSelected(patch)}
                     />
                     <AudioFXPanel
@@ -892,8 +1039,8 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                       onCommit={() => commit(blocks)}
                     />
                     {(() => {
-                      const idx = blocks.findIndex((b) => b.id === selected.id)
-                      if (idx === -1 || idx >= blocks.length - 1) return null
+                      const idx = v1Index(selected.id)
+                      if (idx === -1 || idx >= v1blocks.length - 1) return null
                       const tr: Transition | undefined = selected.transition
                       return (
                         <div className="mt-2 text-xs">
@@ -934,9 +1081,16 @@ export default function Studio({ projectId, fileName, segments, silences, langua
                     />
                     <KeyframesEditor
                       block={selected}
-                      localNow={currentTime - (blockStarts[blocks.findIndex((b) => b.id === selected.id)] ?? 0)}
+                      localNow={currentTime - (blockStarts[v1Index(selected.id)] ?? 0)}
                       dur={blockDur(selected)}
                       onChange={(kfs) => updateSelected({ keyframes: kfs }, true)}
+                      onCommit={() => commit(blocks)}
+                    />
+                    <VideoFXPanel
+                      key={`videofx-${selected.id}`}
+                      block={selected}
+                      projWH={projWH}
+                      onChange={(patch, transient) => updateSelected(patch, transient)}
                       onCommit={() => commit(blocks)}
                     />
                   </>

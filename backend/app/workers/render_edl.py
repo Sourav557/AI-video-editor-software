@@ -14,6 +14,10 @@ Slice 15: blocks may carry audio FX — audio_eq (up to 5 parametric EQ
 bands), audio_denoise (afftdn), role ('music'/'dialogue'), and ducking
 ({threshold, ratio}) on music-role blocks (volume-automation dip where the
 block's source range overlaps dialogue-marked source ranges).
+Slice 16: chroma key (colorkey after geometry normalize), video
+stabilization (vidstab two-pass, deshake fallback, hard error when
+unavailable), and split screen — V2 overlay tiles composited over the
+joined V1 timeline, with per-block canvas layouts and V2 editStart.
 Output: edit.mp4 + edit_edl.json. Idempotent.
 """
 from __future__ import annotations
@@ -175,7 +179,9 @@ def _source_has_audio(video) -> bool:
 
 
 def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
-                 color: list[str] | None = None, reversed_: bool = False) -> str:
+                 color: list[str] | None = None, reversed_: bool = False,
+                 stab_filter: str | None = None, chroma: dict | None = None,
+                 layout: dict | None = None) -> str:
     """-vf string for a keyframed block.
 
     Renders the clip on a transparent WxH canvas: per-frame scale / rotate /
@@ -185,6 +191,11 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
     the whole graded frame is transformed + composited.
     Slice 14: `reversed_` inserts the `reverse` filter before setpts so the
     trimmed range plays backward.
+    Slice 16: `stab_filter` (vidstabdetect for pass 1 / vidstabtransform for
+    pass 2 / deshake) stabilizes the raw frame right after setpts; `chroma`
+    keys after the grade (colorkey -> yuva420p, composited by the overlay);
+    `layout` aspect-fits the fg into the rect and re-centers the overlay on
+    the rect instead of the full canvas.
     """
     SX = _pw_expr(kf.get("scale"), 1.0, "t")
     ROT = _pw_expr(kf.get("rot"), 0.0, "t")
@@ -192,17 +203,32 @@ def _keyframe_vf(kf: dict, W: int, H: int, dur: float, speed: float,
     YY = _pw_expr(kf.get("y"), 0.0, "t")
     # geq's timestamp variable is T (colorchannelmixer's aa rejects `t`)
     AA = _pw_expr(kf.get("op"), 1.0, "T")
-    fg = ",".join([
-        *(['reverse'] if reversed_ else []),
-        f"setpts=PTS/{speed}",
-        *(color or []),
+    fg_parts: list[str] = []
+    if reversed_:
+        fg_parts.append("reverse")
+    fg_parts.append(f"setpts=PTS/{speed}")
+    if stab_filter:
+        fg_parts.append(stab_filter)
+    fg_parts += (color or [])
+    if chroma:
+        fg_parts.append(_chroma_vf(chroma))
+    if layout:
+        lw, lh = layout["w"], layout["h"]
+        fg_parts.append(f"scale={lw}:{lh}:force_original_aspect_ratio=decrease")
+        ox = f"{layout['x']}+({lw}-w)/2+({XX})"
+        oy = f"{layout['y']}+({lh}-h)/2+({YY})"
+    else:
+        ox = f"(W-w)/2+({XX})"
+        oy = f"(H-h)/2+({YY})"
+    fg_parts += [
         f"scale=iw*({SX}):ih*({SX}):eval=frame",
         f"rotate=a=({ROT})*PI/180:fillcolor=black@0",
         "format=rgba",
         f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='p(X,Y)*({AA})'[fg]",
-    ])
+    ]
+    fg = ",".join(fg_parts)
     bg = f"color=c=black@0:s={W}x{H}:d={dur:.3f}:r=30[bg]"
-    ov = (f"[bg][fg]overlay=x=(W-w)/2+({XX}):y=(H-h)/2+({YY})"
+    ov = (f"[bg][fg]overlay=x={ox}:y={oy}"
           f":eof_action=pass,format=yuv420p")
     return f"{fg};{bg};{ov}"
 
@@ -584,6 +610,204 @@ def _piece_duck_ranges(duck_src: list[tuple[float, float]],
     return out
 
 
+# ---- Slice 16: chroma key, stabilization, split screen ----
+# Block fields (all optional):
+#   chroma: {color, similarity, blend} — color is a 6-digit hex string
+#     ("00FF00", default green; a leading '#' is tolerated and stripped);
+#     similarity 0.01–0.5 (default 0.15); blend 0–0.2 (default 0.05).
+#     Rendered as colorkey=0x{color}:{similarity}:{blend} AFTER the geometry
+#     normalize (so it keys the final canvas-size frame) and BEFORE
+#     captions/titles. colorkey outputs yuva420p with the keyed RGB left
+#     intact under alpha=0, so the V1 path premultiplies the alpha into
+#     RGB (keyed region -> black, matching the canvas) before flattening
+#     back to yuv420p — a naive format=yuv420p would just drop the alpha
+#     and leave the green behind. In the keyframe path the key goes into
+#     the fg chain before the canvas overlay, whose alpha compositing
+#     preserves the keyed transparency.
+#   stabilize: bool — video stabilization. Prefers vidstab (two-pass:
+#     vidstabdetect rendered to a null output, then vidstabtransform
+#     inserted BEFORE the geometry normalize, i.e. the raw frame is
+#     stabilized, then normalized). Falls back to single-pass deshake.
+#     Raises a clear error when NEITHER filter exists in this ffmpeg build
+#     (never silently skipped). Two-pass doubles render time for the block.
+#   track: 'v1' | 'v2' (default 'v1') — v2 blocks are overlay tiles
+#     composited OVER the joined V1 timeline in one final pass (so the
+#     xfade join stage is untouched).
+#   layout: {x, y, w, h} — pixel rect on the project canvas. V1 blocks: the
+#     content is aspect-fit into the rect (absence = fullscreen, the old
+#     behavior). V2 tiles: scaled EXACTLY to w×h (absence = bottom-right
+#     quarter PiP). All values clamped into the canvas.
+#   editStart: seconds (V2 only) — edit-time position where the tile
+#     appears (default 0); tile duration = its own block duration.
+# V2 tiles support trim/speed/color/LUT/chroma/stabilize. NOT applied on V2:
+# captions, titles, keyframes, transitions, speed ramps, reverse, freeze.
+# V2 audio is DROPPED (the V1 timeline carries the soundtrack).
+
+_CHROMA_HEX_RE = re.compile(r"^[0-9a-fA-F]{6}$")
+
+
+def _clean_chroma(raw) -> dict | None:
+    """Sanitize block['chroma'] -> {color, similarity, blend} or None."""
+    if not isinstance(raw, dict):
+        return None
+    color = raw.get("color", "")
+    if isinstance(color, str):
+        color = color.strip().lstrip("#")
+    if not isinstance(color, str) or not _CHROMA_HEX_RE.match(color):
+        return None
+
+    def num(v, lo, hi, d):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return d
+        return min(max(f, lo), hi)
+
+    return {"color": color.upper(),
+            "similarity": num(raw.get("similarity"), 0.01, 0.5, 0.15),
+            "blend": num(raw.get("blend"), 0.0, 0.2, 0.05)}
+
+
+def _chroma_vf(c: dict) -> str:
+    return f"colorkey=0x{c['color']}:{c['similarity']:.4f}:{c['blend']:.4f}"
+
+
+def _chroma_flat_vf(c: dict) -> list[str]:
+    """colorkey for the single-track V1 path: key, premultiply the alpha
+    into RGB (keyed region -> black), flatten to yuv420p.
+
+    colorkey leaves the keyed RGB intact under alpha=0, so a naive
+    format=yuv420p right after it just drops the alpha plane and leaves
+    the green behind (verified: 87.8% of a green-screen test frame stayed
+    green). Premultiplying composites the key over black first (verified:
+    0.00% green, foreground object fully intact). The expressions contain
+    no commas, so no \\, escaping is needed for the -vf chain.
+    """
+    return [_chroma_vf(c), "format=rgba",
+            "geq=r='r(X,Y)*alpha(X,Y)/255'"
+            ":g='g(X,Y)*alpha(X,Y)/255'"
+            ":b='b(X,Y)*alpha(X,Y)/255'",
+            "format=yuv420p"]
+
+
+def _clean_track(raw) -> str:
+    return "v2" if raw == "v2" else "v1"
+
+
+def _clean_layout(raw, W: int, H: int) -> dict | None:
+    """Sanitize block['layout'] -> {x, y, w, h} pixel rect on the WxH canvas.
+
+    Requires w/h keys; values clamped so the rect stays inside the canvas.
+    Returns None when absent/invalid (caller applies its own default).
+    """
+    if not isinstance(raw, dict) or "w" not in raw or "h" not in raw:
+        return None
+    try:
+        w = int(float(raw.get("w", 0)))
+        h = int(float(raw.get("h", 0)))
+        x = int(float(raw.get("x", 0)))
+        y = int(float(raw.get("y", 0)))
+    except (TypeError, ValueError):
+        return None
+    w = min(max(w, 16), W)
+    h = min(max(h, 16), H)
+    x = min(max(x, 0), W - w)
+    y = min(max(y, 0), H - h)
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _default_v2_layout(W: int, H: int) -> dict:
+    """Bottom-right quarter PiP (the V2 default when no layout is given)."""
+    w, h = max(16, W // 4), max(16, H // 4)
+    return {"x": W - w - 24, "y": H - h - 24, "w": w, "h": h}
+
+
+def _layout_norm(layout: dict | None, W: int, H: int, norm_tail: str) -> str:
+    """Geometry normalize for a V1 block: fullscreen (norm_tail) or aspect-fit
+    into the layout rect, centered, then placed at (x, y) on the WxH canvas."""
+    if not layout:
+        return norm_tail
+    x, y, w, h = layout["x"], layout["y"], layout["w"], layout["h"]
+    return (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+            f"pad={W}:{H}:{x}:{y},fps=30,format=yuv420p,settb=AVTB")
+
+
+def _clean_edit_start(raw) -> float:
+    try:
+        return max(0.0, float(raw if raw is not None else 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+_stab_cache: dict[str, tuple[bool, bool]] = {}
+
+
+def _stab_availability(ffmpeg: str) -> tuple[bool, bool]:
+    """(has_vidstab, has_deshake) for this ffmpeg binary, checked once."""
+    if ffmpeg not in _stab_cache:
+        pr = subprocess.run([ffmpeg, "-hide_banner", "-filters"],
+                            capture_output=True, text=True)
+        out = pr.stdout
+        has_vidstab = "vidstabdetect" in out and "vidstabtransform" in out
+        has_deshake = re.search(r"(?m)^\s*[A-Z.]{2,3}\s+deshake\s", out) is not None
+        _stab_cache[ffmpeg] = (has_vidstab, has_deshake)
+    return _stab_cache[ffmpeg]
+
+
+_STAB_UNAVAILABLE_MSG = (
+    "Stabilization was requested but this ffmpeg build has neither the "
+    "vidstab filters (vidstabdetect/vidstabtransform) nor deshake. "
+    "Install a full ffmpeg build (e.g. with --enable-libvidstab) to use it.")
+
+
+def _block_stab_mode(want: bool, avail: tuple[bool, bool]) -> str:
+    """'' | 'vidstab' | 'deshake'. Raises when wanted but unavailable."""
+    if not want:
+        return ""
+    if avail[0]:
+        return "vidstab"
+    if avail[1]:
+        return "deshake"
+    raise RuntimeError(_STAB_UNAVAILABLE_MSG)
+
+
+def _stab_pass1(ffmpeg: str, video, s0: float, s1: float, vf_str: str) -> None:
+    """vidstab pass 1: run the segment's -vf chain (with vidstabdetect at the
+    stabilization point) to a null output; the .trf drives pass 2."""
+    subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", str(s0), "-to", str(s1), "-i", str(video),
+                    "-vf", vf_str, "-an", "-f", "null", "-"], check=True)
+
+
+def _composite_v2(ffmpeg: str, pid: str, v1_path: str,
+                  tiles: list[tuple[str, dict, float, float]]) -> str:
+    """Composite V2 overlay tiles over the joined V1 timeline (final pass).
+
+    tiles: [(seg_path, layout, edit_start, edit_end)]. Each tile is delayed
+    to its editStart via setpts and gated with enable=between(t,S,E), so
+    tiles never disturb the V1 join stage. V1 audio is kept; tile audio was
+    dropped at tile-render time. Returns the composite output path.
+    """
+    d = project_dir(pid)
+    out = d / "edit_v2.mp4"
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", v1_path]
+    for seg, _, _, _ in tiles:
+        cmd += ["-i", seg]
+    fc = []
+    cur = "[0:v]"
+    for i, (_, lay, s, e) in enumerate(tiles):
+        fc.append(f"[{i + 1}:v]setpts=PTS-STARTPTS+{s:.3f}/TB[v2_{i}]")
+        fc.append(f"{cur}[v2_{i}]overlay=x={lay['x']}:y={lay['y']}"
+                  f":enable='between(t,{s:.3f},{e:.3f})'[c{i}]")
+        cur = f"[c{i}]"
+    cmd += ["-filter_complex", ";".join(fc), "-map", cur, "-map", "0:a",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", str(out)]
+    subprocess.run(cmd, check=True)
+    return str(out)
+
+
 def _source_audio_params(video) -> tuple[int, str] | None:
     """(sample_rate, channel_layout) of the source's first audio stream, or None."""
     ffprobe = shutil.which("ffprobe")
@@ -647,7 +871,10 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
                       srt_text: str | None, title_fs: list[str],
                       out_path, piece_dur: float, seg_tag: str,
                       fx_af: list[str] | None = None,
-                      duck_af: list[str] | None = None) -> None:
+                      duck_af: list[str] | None = None,
+                      stab_mode: str = "", trf_path: str | None = None,
+                      chroma: dict | None = None,
+                      layout: dict | None = None) -> None:
     """Render one source-span piece of a Slice-14 block.
 
     Same trim/speed/color/normalize/caption chain as the old path, with
@@ -658,19 +885,51 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
     loudnorm; `duck_af` (volume expression, piece-local t) goes after the
     FX but before loudnorm (t-based expressions must precede loudnorm —
     see module docstring).
+    Slice 16: `stab_mode` '' | 'vidstab' | 'deshake'; vidstab runs a detect
+    pass to a null output first (via `trf_path`), then the transform pass.
+    `chroma` keys after the geometry normalize (before captions); `layout`
+    aspect-fits the piece into the canvas rect (V1).
     """
-    vf_pre = ["reverse"] if reversed_ else []
-    if kf:
-        vf_str = _keyframe_vf(kf, W, H, piece_dur, speed, color_vf, reversed_)
-        vf_str += ",fps=30,settb=AVTB"
-    else:
-        vf_str = ",".join(vf_pre + [f"setpts=PTS/{speed}"] + color_vf + [norm_tail])
+    sub_f = None
     if srt_text and srt_text.strip():
         srt_path = project_dir(pid) / f"{seg_tag}.srt"
         srt_path.write_text(srt_text)
-        vf_str += "," + f"subtitles='{_esc(str(srt_path))}':force_style='{_srt_style()}'"
-    if title_fs:
-        vf_str += "," + ",".join(title_fs)
+        sub_f = f"subtitles='{_esc(str(srt_path))}':force_style='{_srt_style()}'"
+
+    def vf_for(stab_filter: str | None) -> str:
+        if kf:
+            s = _keyframe_vf(kf, W, H, piece_dur, speed, color_vf, reversed_,
+                             stab_filter=stab_filter, chroma=chroma,
+                             layout=layout)
+            if sub_f:
+                s += "," + sub_f
+            if title_fs:
+                s += "," + ",".join(title_fs)
+            return s + ",fps=30,settb=AVTB"
+        parts = ["reverse"] if reversed_ else []
+        parts.append(f"setpts=PTS/{speed}")
+        if stab_filter:
+            parts.append(stab_filter)
+        parts += color_vf + [_layout_norm(layout, W, H, norm_tail)]
+        if chroma:
+            # colorkey -> yuva420p; flatten back so the segment stays
+            # concat/xfade-compatible (V2 tiles keep alpha instead).
+            parts += _chroma_flat_vf(chroma)
+        if sub_f:
+            parts.append(sub_f)
+        if title_fs:
+            parts += title_fs
+        return ",".join(parts)
+
+    if stab_mode == "vidstab":
+        _stab_pass1(ffmpeg, video, s0_abs, s1_abs,
+                    vf_for(f"vidstabdetect=shakiness=5:result={trf_path}"))
+        stab_filter = f"vidstabtransform=input={trf_path}:zoom=1:smoothing=10"
+    elif stab_mode == "deshake":
+        stab_filter = "deshake"
+    else:
+        stab_filter = None
+    vf_str = vf_for(stab_filter)
     af_pre = "areverse," if reversed_ else ""
     # Slice 15: EQ/denoise, then the ducking volume expression, then
     # loudnorm (volume must precede loudnorm — see module docstring).
@@ -688,6 +947,50 @@ def _render_seg_piece(ffmpeg: str, pid: str, video, has_audio: bool,
     cmd += ["-vf", vf_str, "-af", af,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "aac", str(out_path)]
+    subprocess.run(cmd, check=True)
+
+
+def _render_v2_tile(ffmpeg: str, pid: str, video, lay: dict,
+                    chroma: dict | None, color_vf: list[str],
+                    stab_mode: str, trf_path: str | None,
+                    src_start: float, src_end: float, speed: float,
+                    out_path) -> None:
+    """Render one V2 overlay tile: trim/speed/color/stabilize/chroma.
+
+    No captions, titles, keyframes, ramps, reverse or freeze (documented).
+    Video-only — the tile's audio is dropped; V1 carries the soundtrack.
+    The tile is scaled EXACTLY to the layout rect (may stretch); when
+    chroma is set the alpha is kept (qtrle) so the composite overlay can
+    punch the keyed transparency through.
+    """
+    w, h = lay["w"], lay["h"]
+
+    def vf_for(stab_filter: str | None) -> str:
+        parts = [f"setpts=PTS/{speed}"]
+        if stab_filter:
+            parts.append(stab_filter)
+        parts += color_vf
+        parts.append(f"scale={w}:{h},setsar=1")
+        if chroma:
+            # keep the keyed alpha for the overlay composite
+            parts += [_chroma_vf(chroma), "format=rgba"]
+        parts.append("fps=30,settb=AVTB")
+        return ",".join(parts)
+
+    if stab_mode == "vidstab":
+        _stab_pass1(ffmpeg, video, src_start, src_end,
+                    vf_for(f"vidstabdetect=shakiness=5:result={trf_path}"))
+        stab_filter = f"vidstabtransform=input={trf_path}:zoom=1:smoothing=10"
+    elif stab_mode == "deshake":
+        stab_filter = "deshake"
+    else:
+        stab_filter = None
+    vcodec = (["-c:v", "qtrle"] if chroma
+              else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", str(src_start), "-to", str(src_end), "-i", str(video),
+           "-vf", vf_for(stab_filter), "-an",
+           *vcodec, str(out_path)]
     subprocess.run(cmd, check=True)
 
 
@@ -792,13 +1095,32 @@ def run(job, report) -> dict:
                        "src_end": src_end, "span": span, "speed": speed,
                        "ramps": ramps, "freeze": freeze,
                        "reversed": reversed_, "out_dur": out_dur,
-                       "edit_start": _cur})
+                       "edit_start": _cur,
+                       "track": _clean_track(b.get("track"))})
         _cur += out_dur
+
+    # Slice 16: split the main V1 sequence from V2 overlay tiles. V2 tiles
+    # do not participate in the edit layout, joins or transitions.
+    v1 = [L for L in layout if L["track"] == "v1"]
+    v2 = [L for L in layout if L["track"] == "v2"]
+    if not v1:
+        raise RuntimeError("no V1 blocks — the main timeline is empty")
+
+    # Slice 16: stabilization filter availability, checked once per job.
+    # Fails fast here so a missing filter never burns render time first.
+    stab_avail = (_stab_availability(ffmpeg)
+                  if any(bool(b.get("stabilize")) for b in blocks)
+                  else (False, False))
+    if any(bool(b.get("stabilize")) for b in blocks) and not any(stab_avail):
+        # Fail fast: never burn render time before discovering the filter
+        # is missing, and never silently skip stabilization.
+        raise RuntimeError(_STAB_UNAVAILABLE_MSG)
 
     # Slice 15: dialogue source ranges (absolute source timebase, merged) —
     # the ducking reference. Muted dialogue blocks are silent: excluded.
+    # Slice 16: V1 only (V2 tiles carry no audio).
     dialogue_src = _merge_ranges([
-        (L["src_start"], L["src_end"]) for L in layout
+        (L["src_start"], L["src_end"]) for L in v1
         if _clean_role(L["b"].get("role")) == "dialogue"
         and not L["b"].get("muted", False)])
 
@@ -818,7 +1140,7 @@ def run(job, report) -> dict:
     # Slice 14: freeze stills need silent audio matching the source's params
     # so the block-level -c copy concat stays uniform.
     src_audio = _source_audio_params(video) if has_audio else None
-    for li, L in enumerate(layout):
+    for li, L in enumerate(v1):
         b = L["b"]
         n = L["n"]
         src_start, src_end = L["src_start"], L["src_end"]
@@ -828,6 +1150,10 @@ def run(job, report) -> dict:
         muted = bool(b.get("muted", False))
         s14 = bool(ramps) or freeze is not None or reversed_
         kf = _clean_keyframes(b.get("keyframes"), out_dur)
+        # ---- Slice 16: per-block chroma / stabilization / canvas layout ----
+        stab_mode = _block_stab_mode(bool(b.get("stabilize")), stab_avail)
+        chroma = _clean_chroma(b.get("chroma"))
+        lay = _clean_layout(b.get("layout"), W, H)
         # ---- Slice 15: per-block audio FX ----
         fx_af = _eq_af(_clean_eq(b.get("audio_eq")))
         if b.get("audio_denoise"):
@@ -867,6 +1193,8 @@ def run(job, report) -> dict:
                      "-frames:v", "1", str(frame_png)], check=True)
             for m, p in enumerate(pieces):
                 pf = project_dir(pid) / f"edl_seg_{n}_p{m}.mp4"
+                trf = (project_dir(pid) / f"edl_seg_{n}_p{m}.trf"
+                       if stab_mode == "vidstab" else None)
                 if p[0] == "still":
                     _, at, dur, _ = p
                     title_fs = _title_filters(
@@ -893,8 +1221,15 @@ def run(job, report) -> dict:
                                       src_start + s0, src_start + s1, v,
                                       muted, reversed_, pkf, color_vf,
                                       srt_text, title_fs, pf, pdur,
-                                      f"edl_seg_{n}_p{m}", fx_af, p_duck)
+                                      f"edl_seg_{n}_p{m}", fx_af, p_duck,
+                                      stab_mode, str(trf) if trf else None,
+                                      chroma, lay)
                     piece_offset += pdur
+                    if trf:
+                        try:
+                            trf.unlink()
+                        except OSError:
+                            pass
                 piece_files.append(str(pf))
             lst = project_dir(pid) / f"edl_seg_{n}_pieces.txt"
             lst.write_text("".join(f"file '{p}'\n" for p in piece_files))
@@ -916,7 +1251,7 @@ def run(job, report) -> dict:
             seg_durs.append(out_dur)
             kept_blocks.append(b)
             edit_cursor += out_dur
-            report(0.1 + 0.8 * (li + 1) / max(1, len(layout)))
+            report(0.1 + 0.8 * (li + 1) / max(1, len(v1)))
             continue
 
         srt_path = None
@@ -932,16 +1267,42 @@ def run(job, report) -> dict:
         if kf:
             # ---- Slice 11: keyframed transform path (captions/titles stay
             # fixed on the canvas, applied after the overlay) ----
-            vf_str = _keyframe_vf(kf, W, H, out_dur, speed, color_vf)
-            if cap_filters:
-                vf_str += "," + ",".join(cap_filters)
-            vf_str += ",fps=30,settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
+            def vf_for(stab_filter: str | None) -> str:
+                s = _keyframe_vf(kf, W, H, out_dur, speed, color_vf,
+                                 stab_filter=stab_filter, chroma=chroma,
+                                 layout=lay)
+                if cap_filters:
+                    s += "," + ",".join(cap_filters)
+                return s + ",fps=30,settb=AVTB"  # Slice 12: xfade-safe CFR + timebase
         else:
             # ---- original path + Slice 12 normalization ----
             # Slice 13: color grade sits after setpts and before the
             # geometry/pix_fmt normalization + captions/titles burn.
-            vf = [f"setpts=PTS/{speed}"] + color_vf + [norm_tail] + cap_filters
-            vf_str = ",".join(vf)
+            # Slice 16: stabilization goes before the geometry normalize
+            # (raw frame first), chroma key goes after it (canvas-size
+            # frame), layout swaps the fullscreen normalize for a rect fit.
+            norm = _layout_norm(lay, W, H, norm_tail)
+
+            def vf_for(stab_filter: str | None) -> str:
+                parts = [f"setpts=PTS/{speed}"]
+                if stab_filter:
+                    parts.append(stab_filter)
+                parts += color_vf + [norm]
+                if chroma:
+                    parts += _chroma_flat_vf(chroma)
+                parts += cap_filters
+                return ",".join(parts)
+
+        if stab_mode == "vidstab":
+            trf = project_dir(pid) / f"edl_seg_{n}.trf"
+            _stab_pass1(ffmpeg, video, src_start, src_end,
+                        vf_for(f"vidstabdetect=shakiness=5:result={trf}"))
+            stab_filter = f"vidstabtransform=input={trf}:zoom=1:smoothing=10"
+        elif stab_mode == "deshake":
+            stab_filter = "deshake"
+        else:
+            stab_filter = None
+        vf_str = vf_for(stab_filter)
 
         # Slice 12: every segment carries an audio stream so acrossfade's
         # filter graph is uniform. Muted = silent audio, not dropped stream.
@@ -967,11 +1328,16 @@ def run(job, report) -> dict:
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", str(out)]
         subprocess.run(cmd, check=True)
+        if stab_mode == "vidstab":
+            try:
+                (project_dir(pid) / f"edl_seg_{n}.trf").unlink()
+            except OSError:
+                pass
         seg_files.append(str(out))
         seg_durs.append(out_dur)
         kept_blocks.append(b)
         edit_cursor += out_dur  # == (src_end - src_start) / speed on the old path
-        report(0.1 + 0.8 * (li + 1) / max(1, len(layout)))
+        report(0.1 + 0.8 * (li + 1) / max(1, len(v1)))
 
     if not seg_files:
         raise RuntimeError("all blocks were empty")
@@ -986,6 +1352,45 @@ def run(job, report) -> dict:
             os.unlink(p)
         except OSError:
             pass
+
+    # ---- Slice 16: V2 overlay tiles, composited over the joined V1 timeline.
+    # The join stage above is untouched; this is one final re-encode pass.
+    # V2 tiles: constant speed only (ramps/reverse/freeze/keyframes not
+    # applied); no captions/titles/transitions; audio dropped.
+    tiles: list[tuple[str, dict, float, float]] = []
+    for L in v2:
+        b = L["b"]
+        n = L["n"]
+        src_start, src_end = L["src_start"], L["src_end"]
+        span = L["span"]
+        speed = min(4.0, max(0.25, float(b.get("speed", 1.0))))
+        vdur = span / speed
+        if vdur < 0.05:
+            continue
+        lay = _clean_layout(b.get("layout"), W, H) or _default_v2_layout(W, H)
+        estart = _clean_edit_start(b.get("editStart"))
+        chroma = _clean_chroma(b.get("chroma"))
+        color_vf = _color_vf(_clean_color(b.get("color")), b.get("lut"))
+        stab_mode = _block_stab_mode(bool(b.get("stabilize")), stab_avail)
+        tile = project_dir(pid) / f"edl_v2_{n}.mov"
+        trf = project_dir(pid) / f"edl_v2_{n}.trf"
+        _render_v2_tile(ffmpeg, pid, video, lay, chroma, color_vf, stab_mode,
+                        str(trf) if stab_mode == "vidstab" else None,
+                        src_start, src_end, speed, tile)
+        try:
+            trf.unlink()
+        except OSError:
+            pass
+        tiles.append((str(tile), lay, estart, estart + vdur))
+        report(0.9 + 0.05 * (len(tiles)) / max(1, len(v2)))
+    if tiles:
+        comp = _composite_v2(ffmpeg, pid, str(out), tiles)
+        os.replace(comp, str(out))
+        for seg, _, _, _ in tiles:
+            try:
+                os.unlink(seg)
+            except OSError:
+                pass
 
     # output duration via ffprobe
     ffprobe = shutil.which("ffprobe")
@@ -1003,7 +1408,11 @@ def run(job, report) -> dict:
            "eq": sum(1 for x in blocks if x.get("audio_eq")),
            "denoise": sum(1 for x in blocks if x.get("audio_denoise")),
            "ducking": sum(1 for x in blocks
-                           if x.get("role") == "music" and x.get("ducking"))}
+                           if x.get("role") == "music" and x.get("ducking")),
+           "chroma": sum(1 for x in blocks if x.get("chroma")),
+           "stabilized": sum(1 for x in blocks if x.get("stabilize")),
+           "v2_tiles": len(tiles),
+           "layouts": sum(1 for x in blocks if x.get("layout"))}
     save_json(pid, "edit_edl.json", edl)
     report(1.0)
     return {"file": out.name, "blocks": len(blocks),

@@ -37,6 +37,22 @@ export interface Block {
    *  Dips the block where its source range overlaps dialogue-marked source
    *  ranges; depth = 1/ratio. threshold is reserved for a future sidechain. */
   ducking?: DuckingConfig
+  /** Slice 16: chroma key (green-screen removal). color = 6-digit hex
+   *  (no '#'), similarity 0.01–0.5, blend 0–0.2. Rendered after the
+   *  geometry normalize, before captions/titles. */
+  chroma?: ChromaKey
+  /** Slice 16: video stabilization (vidstab two-pass, deshake fallback).
+   *  Two-pass doubles render time for this clip. */
+  stabilize?: boolean
+  /** Slice 16: 'v1' (default) = main timeline; 'v2' = overlay tile
+   *  composited over V1 at `editStart`. V2 tiles are video-only. */
+  track?: BlockTrack
+  /** Slice 16: pixel rect {x,y,w,h} on the project canvas. V1: content is
+   *  aspect-fit into the rect (absence = fullscreen). V2: tile scaled
+   *  exactly to the rect (absence = bottom-right quarter PiP). */
+  layout?: BlockLayout
+  /** Slice 16: V2 only — edit-time seconds where the tile appears. */
+  editStart?: number
 }
 
 /** Per-clip color grade (Slice 13). All optional; undefined = default. */
@@ -154,6 +170,66 @@ export const EQ_RANGES = {
 
 /** Default ducking sliders (Slice 15). */
 export const DUCKING_DEFAULTS: DuckingConfig = { threshold: 0.03, ratio: 4 }
+
+/** Slice 16: chroma key spec. color = 6-digit hex without '#'
+ *  (e.g. '00FF00'); similarity 0.01–0.5; blend 0–0.2. */
+export interface ChromaKey { color: string; similarity: number; blend: number }
+
+/** Slice 16: chroma key defaults (green screen). */
+export const CHROMA_DEFAULTS: ChromaKey = { color: '00FF00', similarity: 0.15, blend: 0.05 }
+
+/** Slice 16: video track — v1 is the main timeline, v2 tiles overlay it. */
+export type BlockTrack = 'v1' | 'v2'
+
+/** Slice 16: tile geometry in PIXELS on the project canvas (W×H). */
+export interface BlockLayout { x: number; y: number; w: number; h: number }
+
+/** 'v2' only when explicitly set; everything else is main-timeline. */
+export const blockTrack = (b: Block): BlockTrack => (b.track === 'v2' ? 'v2' : 'v1')
+
+/** Main-timeline blocks (the end-to-end sequence). */
+export const v1BlocksOf = (blocks: Block[]): Block[] =>
+  blocks.filter((b) => blockTrack(b) === 'v1')
+
+/** Overlay-tile blocks (composited over V1 at their editStart). */
+export const v2BlocksOf = (blocks: Block[]): Block[] =>
+  blocks.filter((b) => blockTrack(b) === 'v2')
+
+/** Slice 16: V2 tile output duration — constant speed only (the renderer
+ *  ignores ramps/reverse/freeze on V2 tiles). */
+export const blockV2Dur = (b: Block): number => {
+  const span = Math.max(0, b.srcEnd - b.srcStart)
+  const speed = Math.min(4, Math.max(0.25, b.speed || 1))
+  return Math.max(0.01, span / speed)
+}
+
+/** Slice 16: layout presets (need the project canvas W/H).
+ *  'fullscreen' → undefined (V1 default: fill the canvas). */
+export function layoutPreset(name: string, W: number, H: number): BlockLayout | undefined {
+  switch (name) {
+    case 'left': return { x: 0, y: 0, w: Math.floor(W / 2), h: H }
+    case 'right': return { x: Math.ceil(W / 2), y: 0, w: Math.floor(W / 2), h: H }
+    case 'top-left': return { x: 0, y: 0, w: Math.floor(W / 2), h: Math.floor(H / 2) }
+    case 'top-right': return { x: Math.ceil(W / 2), y: 0, w: Math.floor(W / 2), h: Math.floor(H / 2) }
+    case 'bottom-left': return { x: 0, y: Math.ceil(H / 2), w: Math.floor(W / 2), h: Math.floor(H / 2) }
+    case 'pip': {
+      const w = Math.floor(W / 4), h = Math.floor(H / 4)
+      return { x: W - w - 24, y: H - h - 24, w, h }
+    }
+    default: return undefined
+  }
+}
+
+/** Slice 16: layout preset buttons for the split-screen panel. */
+export const LAYOUT_PRESET_NAMES: { id: string; label: string }[] = [
+  { id: 'fullscreen', label: 'Fullscreen' },
+  { id: 'left', label: 'Left half' },
+  { id: 'right', label: 'Right half' },
+  { id: 'top-left', label: 'Top-left ¼' },
+  { id: 'top-right', label: 'Top-right ¼' },
+  { id: 'bottom-left', label: 'Bottom-left ¼' },
+  { id: 'pip', label: 'Bottom-right PiP' },
+]
 
 /** One speed-ramp keyframe (Slice 14). t = seconds in SOURCE timebase,
  *  relative to the block's srcStart. */
@@ -300,15 +376,21 @@ export default function Timeline(p: Props) {
   const [drag, setDrag] = useState<null | {
     id: string; mode: 'move' | 'trim-l' | 'trim-r'; startX: number; orig: Block; over: number
   }>(null)
+  /** Slice 16: V2 tile drag — move shifts editStart, trims change the source range. */
+  const [v2drag, setV2drag] = useState<null | {
+    id: string; mode: 'move' | 'trim-l' | 'trim-r'; startX: number; orig: Block
+  }>(null)
   const [tdrag, setTdrag] = useState<null | {
     id: string; mode: 'move' | 'trim-l' | 'trim-r'; startX: number; orig: TitleT
   }>(null)
 
-  const { starts, total } = useMemo(() => layoutBlocks(p.blocks), [p.blocks])
+  const v1 = useMemo(() => v1BlocksOf(p.blocks), [p.blocks])
+  const v2 = useMemo(() => v2BlocksOf(p.blocks), [p.blocks])
+  const { starts, total } = useMemo(() => layoutBlocks(v1), [v1])
   const width = Math.max(50, total * p.pxPerSec)
   const mappedPeaks = useMemo(
-    () => remapPeaksBlocks(p.peaks, p.srcDuration, p.blocks),
-    [p.peaks, p.srcDuration, p.blocks],
+    () => remapPeaksBlocks(p.peaks, p.srcDuration, v1),
+    [p.peaks, p.srcDuration, v1],
   )
 
   // waveform
@@ -369,9 +451,9 @@ export default function Timeline(p: Props) {
       if (cutSrc - b.srcStart < 0.15 || b.srcEnd - cutSrc < 0.15) return
       const left: Block = { ...b, srcEnd: cutSrc }
       const right: Block = { ...b, id: newId(), srcStart: cutSrc }
-      const next = [...p.blocks]
-      next.splice(idx, 1, left, right)
-      p.commit(next)
+      const nv1 = [...v1]
+      nv1.splice(idx, 1, left, right)
+      p.commit([...nv1, ...v2])
       p.onSelect(right.id)
       return
     }
@@ -386,11 +468,11 @@ export default function Timeline(p: Props) {
     if (!drag) return
     const dxEdit = (e.clientX - drag.startX) / p.pxPerSec
     if (drag.mode === 'move') {
-      const fromIdx = p.blocks.findIndex((bb) => bb.id === drag.id)
+      const fromIdx = v1.findIndex((bb) => bb.id === drag.id)
       const targetCenter = starts[fromIdx] + dxEdit + blockDur(drag.orig) / 2
-      let over = p.blocks.length - 1
-      for (let i = 0; i < p.blocks.length; i++) {
-        if (targetCenter < starts[i] + blockDur(p.blocks[i])) { over = i; break }
+      let over = v1.length - 1
+      for (let i = 0; i < v1.length; i++) {
+        if (targetCenter < starts[i] + blockDur(v1[i])) { over = i; break }
       }
       setDrag({ ...drag, over })
     } else {
@@ -409,17 +491,56 @@ export default function Timeline(p: Props) {
 
   const onBlockUp = () => {
     if (drag?.mode === 'move') {
-      const from = p.blocks.findIndex((bb) => bb.id === drag.id)
+      const from = v1.findIndex((bb) => bb.id === drag.id)
       if (from !== -1 && drag.over !== from) {
-        const next = [...p.blocks]
-        const [bb] = next.splice(from, 1)
-        next.splice(drag.over, 0, bb)
-        p.commit(next)
+        const nv1 = [...v1]
+        const [bb] = nv1.splice(from, 1)
+        nv1.splice(drag.over, 0, bb)
+        p.commit([...nv1, ...v2])
       }
     } else if (drag) {
       p.commit(p.blocks)
     }
     setDrag(null)
+  }
+
+  /** Slice 16: V2 tile interactions — horizontal move = editStart, edge
+   *  drag = trim source range. No razor/reorder on the overlay track. */
+  const onV2Down = (e: React.PointerEvent, b: Block) => {
+    if (p.trackLocked) return
+    e.stopPropagation()
+    p.onSelect(b.id); p.onSelectTitle(null)
+    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect()
+    const edge = e.clientX - rect.left < 8 ? 'trim-l'
+      : rect.right - e.clientX < 8 ? 'trim-r' : 'move'
+    ;(e.target as HTMLElement).setPointerCapture?.(e.pointerId)
+    setV2drag({ id: b.id, mode: edge, startX: e.clientX, orig: { ...b } })
+  }
+
+  const onV2Move = (e: React.PointerEvent) => {
+    if (!v2drag) return
+    const dx = (e.clientX - v2drag.startX) / p.pxPerSec
+    const next = p.blocks.map((bb) => {
+      if (bb.id !== v2drag.id) return bb
+      const nb = { ...bb }
+      if (v2drag.mode === 'move') {
+        nb.editStart = Math.max(0, (v2drag.orig.editStart ?? 0) + dx)
+      } else if (v2drag.mode === 'trim-l') {
+        const dSrc = dx * v2drag.orig.speed
+        nb.srcStart = Math.min(v2drag.orig.srcStart + dSrc, v2drag.orig.srcEnd - 0.1)
+      } else {
+        const dSrc = dx * v2drag.orig.speed
+        nb.srcEnd = Math.max(v2drag.orig.srcEnd + dSrc, v2drag.orig.srcStart + 0.1)
+      }
+      nb.srcStart = Math.max(0, nb.srcStart)
+      return nb
+    })
+    p.commit(next, true)
+  }
+
+  const onV2Up = () => {
+    if (v2drag) p.commit(p.blocks)
+    setV2drag(null)
   }
 
   // ---- title chips ----
@@ -473,6 +594,11 @@ export default function Timeline(p: Props) {
           <div className="h-9 border-b flex items-center justify-center gap-2" style={{ borderColor: 'var(--border)' }}>
             <span className="text-[10px] font-bold faint">T2</span>
           </div>
+          {/* Slice 16: V2 overlay track */}
+          <div className="h-12 border-b flex flex-col items-center justify-center gap-0.5" style={{ borderColor: 'var(--border)' }}>
+            <span className="text-[10px] font-bold" style={{ color: 'var(--warning)' }}>V2</span>
+            <span className="faint text-[8px]">overlay</span>
+          </div>
           <div className="h-16 border-b flex flex-col items-center justify-center gap-1" style={{ borderColor: 'var(--border)' }}>
             <span className="text-[10px] font-bold faint">V1</span>
             <button title={p.trackLocked ? 'Unlock track' : 'Lock track'}
@@ -522,11 +648,50 @@ export default function Timeline(p: Props) {
               ))}
             </div>
 
+            {/* Slice 16: V2 overlay track — tiles positioned by editStart */}
+            <div className="relative h-12 border-b" style={{ borderColor: 'var(--border)', background: '#0d0b16' }}
+                 onClick={seekFromEvent}
+                 onPointerMove={onV2Move} onPointerUp={onV2Up} onPointerLeave={onV2Up}>
+              {v2.length === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center faint text-[10px] pointer-events-none">
+                  overlay track — set a clip to V2 in Clip Properties
+                </div>
+              )}
+              {v2.map((b) => {
+                const sel = b.id === p.selectedId
+                const dur = blockV2Dur(b)
+                return (
+                  <div key={b.id}
+                       onPointerDown={(e) => onV2Down(e, b)}
+                       className="absolute inset-y-2 rounded overflow-hidden"
+                       title={`V2 overlay · ${fmtTime(b.srcStart)} → ${fmtTime(b.srcEnd)} · starts at ${fmtTime(b.editStart ?? 0)}`}
+                       style={{
+                         left: (b.editStart ?? 0) * p.pxPerSec,
+                         width: Math.max(4, dur * p.pxPerSec),
+                         background: 'rgba(120,72,10,.85)',
+                         border: sel ? '2px solid var(--warning)' : '1px solid rgba(245,158,11,.6)',
+                         cursor: 'grab',
+                       }}>
+                    <div className="absolute inset-y-0 left-0 w-2 cursor-ew-resize z-10"
+                         style={{ background: 'rgba(255,255,255,.25)' }} />
+                    <div className="absolute inset-y-0 right-0 w-2 cursor-ew-resize z-10"
+                         style={{ background: 'rgba(255,255,255,.25)' }} />
+                    {dur * p.pxPerSec > 60 && (
+                      <div className="absolute bottom-0 left-0 right-0 text-[9px] px-2 py-0.5 truncate z-10"
+                           style={{ background: 'rgba(0,0,0,.55)' }}>
+                        ⧉ {fmtTime(b.srcStart)}→{fmtTime(b.srcEnd)}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+
             {/* V1 */}
             <div className="relative h-16 border-b" style={{ borderColor: 'var(--border)', background: '#0b0e14', cursor: p.tool === 'razor' ? 'crosshair' : 'default' }}
                  onClick={seekFromEvent}
                  onPointerMove={onBlockMove} onPointerUp={onBlockUp} onPointerLeave={onBlockUp}>
-              {p.blocks.map((b, i) => {
+              {v1.map((b, i) => {
                 const sel = b.id === p.selectedId
                 return (
                   <div key={b.id}
@@ -560,7 +725,7 @@ export default function Timeline(p: Props) {
                      style={{ left: starts[Math.min(drag.over, starts.length - 1)] * p.pxPerSec, background: 'var(--warning)' }} />
               )}
               {/* Slice 12: transition markers on joins (pointer-events-none: drag-free) */}
-              {p.blocks.map((b, i) => (i < p.blocks.length - 1 && b.transition ? (
+              {v1.map((b, i) => (i < v1.length - 1 && b.transition ? (
                 <div key={`tr-${b.id}`}
                      className="absolute top-0 bottom-0 flex items-center pointer-events-none z-20"
                      style={{ left: (starts[i] + blockDur(b)) * p.pxPerSec, transform: 'translateX(-50%)' }}>
